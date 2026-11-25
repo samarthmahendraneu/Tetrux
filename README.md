@@ -55,7 +55,7 @@
 
 1. **Minimizing User/Kernel Mode Switches**
    - **Single-syscall `kevent` batching (macOS/BSD)**: All FD additions, write-arming (`EV_ONESHOT`), and backpressure read-pauses (`EV_DISABLE`/`EV_ENABLE`) are queued into a `changelist` and submitted inside the **same `kevent()` call** that retrieves ready events.
-   - **Listener option inheritance (macOS)**: Accepted sockets inherit `O_NONBLOCK`, `TCP_NODELAY`, `SO_NOSIGPIPE`, and buffer sizes from the listener, eliminating 3–4 syscalls per accepted connection.
+   - **Listener option inheritance (macOS)**: Accepted sockets inherit `O_NONBLOCK`, `TCP_NODELAY`, `SO_NOSIGPIPE`, and buffer sizes from the listener, eliminating 3-4 syscalls per accepted connection.
    - **Coalesced cross-thread wakeups**: The sharded acceptor suppresses `EVFILT_USER` wakeup syscalls whenever the target worker is active or spinning (**80.7% wakeups suppressed** during connection storms).
    - **Short-read fast exit**: Level-triggered `EVFILT_READ` skips the redundant `EAGAIN` `read()` syscall on RPC responses smaller than the scratch buffer.
    - **Batched UDP syscalls**: Uses native macOS Darwin `recvmsg_x` / `sendmsg_x` (and Linux `recvmmsg` / `sendmmsg`) to send/receive up to 64 datagrams per mode switch (**96.1% reduction in I/O syscalls**, **32.96 pkts/syscall**).
@@ -77,7 +77,7 @@
 
 Measured on **Apple M3 Pro (11 cores: 5 P-cores + 6 E-cores, 128B L1 cache lines, macOS Darwin 27.0.0, `rustc 1.91.1 --release` with `lto = "fat"`)**:
 
-### Suite 1 — Kernel-Bypass Zero-Copy UMEM L4 Engine (`0` Syscalls, `0` Copies, `0` Heap Allocs)
+### Suite 1: Kernel-Bypass Zero-Copy UMEM L4 Engine (`0` Syscalls, `0` Copies, `0` Heap Allocs)
 
 | Workload | Throughput | Wire Rate | Cost/Pkt | Ring Lat p50 / p99 / p99.9 | Heap Allocs | Drops | Vol. Ctx Sw |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -92,37 +92,37 @@ Measured on **Apple M3 Pro (11 cores: 5 P-cores + 6 E-cores, 128B L1 cache lines
 | 1i. 4-Core **DSR L2** (1024B wire) | **174.36 Mpps** | **1,456.28 Gbps** | 22.9 ns | 60.4 / 286.7 / 639.0 µs | **0** | **0** | **0** |
 | 1j. Micro-Burst (5×40k, 16k flows) | **57.10 Mpps** | 38.37 Gbps | 17.5 ns | 67.6 / 143.4 / 150.4 µs | **0** | **0** | **0** |
 
-### Suite 2 — L4 TCP High-Throughput Bulk Transfer (8 Concurrent 64 KiB Bidirectional Streams)
+### Suite 2: L4 TCP High-Throughput Bulk Transfer (8 Concurrent 64 KiB Bidirectional Streams)
 
 | Engine | Throughput | Vol. Ctx Switches | RSS | Delta vs Baseline |
 |---|---:|---:|---:|---|
-| Baseline (`std::net` thread/conn) | 25.15 Gbps | 444,291 | 22.2 MiB | — |
+| Baseline (`std::net` thread/conn) | 25.15 Gbps | 444,291 | 22.2 MiB | - |
 | **Tetrux L4 TCP (4w, busy-poll)** | **31.68 Gbps** | **209,546** | **16.6 MiB** | **+26.0% Gbps, -52.8% vcs, -25.2% RSS** |
 
-### Suite 3 — L4 TCP RPC Throughput & Tail Latency (256B Payload)
+### Suite 3: L4 TCP RPC Throughput & Tail Latency (256B Payload)
 
 | Mode | Throughput | p50 | p99 | p99.9 | Max | Vol. Ctx Sw |
 |---|---:|---:|---:|---:|---:|---:|
-| **3A. Max-Rate (32 clients)** — Baseline `std::net` | 95,692 RPS | 319.5 µs | 671.7 µs | 2,424.8 µs | 12,749.8 µs | 575,591 |
-| **3A. Max-Rate** — **Tetrux TCP (Interrupt)** | **100,873 RPS** | 319.5 µs | 483.3 µs | **770.0 µs** | **5,719.8 µs** | **202,140** |
-| **3A. Max-Rate** — **Tetrux TCP (Busy-Poll 200µs)** | 96,895 RPS | 319.5 µs | **466.9 µs** | 1,998.8 µs | 9,574.3 µs | **194,376** |
-| **3B. Open-Loop Paced (20k RPS)** — Tetrux Interrupt | 19,999 RPS | 434.2 µs | 802.8 µs | **901.1 µs** | **1,015.3 µs** | 40,106 |
-| **3B. Open-Loop Paced (20k RPS)** — Tetrux Busy-Poll | 19,998 RPS | **417.8 µs** | 802.8 µs | **901.1 µs** | 1,051.8 µs | 40,093 |
+| **3A. Max-Rate (32 clients)** (Baseline `std::net`) | 95,692 RPS | 319.5 µs | 671.7 µs | 2,424.8 µs | 12,749.8 µs | 575,591 |
+| **3A. Max-Rate** (**Tetrux TCP Interrupt**) | **100,873 RPS** | 319.5 µs | 483.3 µs | **770.0 µs** | **5,719.8 µs** | **202,140** |
+| **3A. Max-Rate** (**Tetrux TCP Busy-Poll 200µs**) | 96,895 RPS | 319.5 µs | **466.9 µs** | 1,998.8 µs | 9,574.3 µs | **194,376** |
+| **3B. Open-Loop Paced (20k RPS)** (Tetrux Interrupt) | 19,999 RPS | 434.2 µs | 802.8 µs | **901.1 µs** | **1,015.3 µs** | 40,106 |
+| **3B. Open-Loop Paced (20k RPS)** (Tetrux Busy-Poll) | 19,998 RPS | **417.8 µs** | 802.8 µs | **901.1 µs** | 1,051.8 µs | 40,093 |
 
-### Suite 4 — Mixed Elephant + Mouse Tail-Latency Isolation (6 Bulk Streams + 8 Mouse RPCs)
+### Suite 4: Mixed Elephant + Mouse Tail-Latency Isolation (6 Bulk Streams + 8 Mouse RPCs)
 
 | Scheduler | Elephant Throughput | Mouse p99.9 | Mouse Max | Improvement |
 |---|---:|---:|---:|---|
-| FIFO Unbounded (`2 MiB/turn`) | 34.55 Gbps | 2,949.1 µs | 4,394.4 µs | — |
+| FIFO Unbounded (`2 MiB/turn`) | 34.55 Gbps | 2,949.1 µs | 4,394.4 µs | - |
 | **Tetrux Mouse-First + 16 KiB Budget** | 29.18 Gbps | **2,293.8 µs** | **3,044.1 µs** | **-22.2% p99.9, -30.7% max** |
 
-### Suite 5 — Connection Storm & Idle CPU Recovery (5 Waves × 100 Simultaneous New Conns + 5,000 RPCs)
+### Suite 5: Connection Storm & Idle CPU Recovery (5 Waves × 100 Simultaneous New Conns + 5,000 RPCs)
 
 - **Success rate:** `500 / 500` (**0 drops**) in `0.26s`
 - **Wakeups suppressed:** `80.7%` (coalesced `EVFILT_USER` skipped on active workers)
 - **Peak pooled buffers leased:** `0` | **RSS:** `7.9 -> 8.0 MiB` | **Post-burst Idle CPU:** `0.67%`
 
-### Suite 6 — L4 UDP Mode-Switch Reduction (`recvfrom`/`sendto` vs Darwin `recvmsg_x`/`sendmsg_x`)
+### Suite 6: L4 UDP Mode-Switch Reduction (`recvfrom`/`sendto` vs Darwin `recvmsg_x`/`sendmsg_x`)
 
 | Mode | Throughput | Pkts/Syscall | Total I/O Syscalls | NLB CPU/Pkt | p50 | p99 | p99.9 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -130,13 +130,13 @@ Measured on **Apple M3 Pro (11 cores: 5 P-cores + 6 E-cores, 128B L1 cache lines
 | **Tetrux UDP Batched (`recvmsg_x`)** | **279,166 PPS** | **32.96** | **33,954** | **3,553 ns** | **835.6 µs** | **1,212.4 µs** | **1,540.1 µs** |
 | **Improvement** | **+29.1%** | **33.3x** | **-96.1% syscalls** | **-22.9% CPU** | **-22.7%** | **-14.0%** | **-45.3%** |
 
-### Suite 7 — Low Memory Footprint & Idle Scaling (1,000 Live Concurrent TCP Connections)
+### Suite 7: Low Memory Footprint & Idle Scaling (1,000 Live Concurrent TCP Connections)
 
 - **RSS:** `8.02 MiB -> 8.19 MiB` (**+0.17 MiB total ≈ 180 bytes per live connection** including client/backend socket overhead)
 - **Peak pooled backpressure buffers leased:** `0`
 - **Isolated NLB Idle CPU with 1,000 open connections:** **`0.26%`**
 
-### Suite 8 — Tier-0 Live Control Plane, DNS, Weight Tuning, Prometheus & PROXY v2 (`--suite control`)
+### Suite 8: Tier-0 Live Control Plane, DNS, Weight Tuning, Prometheus & PROXY v2 (`--suite control`)
 
 - Registered static IP (`weight=1`) + `localhost` DNS target (`weight=1`) → **50.0% / 50.0%** exact connection split
 - Live-tuned weight via `PUT /targets/weight` (`4:1`, zero restart, zero dataplane lock) → **80.0% / 20.0%** (`+160 / +40` conns)
@@ -157,8 +157,8 @@ Tetrux implements the building blocks required to deploy horizontally across glo
 - **Hardened Control Plane & Observability** ([src/control.rs](src/control.rs), [src/proto/json.rs](src/proto/json.rs)): Constant-time `--admin-token` Bearer auth, `--admin-allow` source CIDR allowlist, SSRF metadata target block (`169.254.0.0/16`), slowloris concurrency/size cap, `catch_unwind` isolation, strict RFC-8259 JSON parser, structured JSON `--audit-log`, and native `GET /metrics` Prometheus exposition.
 
 ### Fleet Capacity Model for 1 Billion RPS Across Global Anycast DCs
-- **Per-core measured DSR IPIP packet budget**: `~82 Mpps` (userspace UMEM); accounting for real Linux NIC PCIe/DMA overhead (~20–30 Mpps/core on 100G/200G ConnectX-6/7 with `AF_XDP` zero-copy + RSS), a single 64-core L4 edge node sustains **~1.2–1.5 Bpps / ~250–400M RPS** (at ~3–5 packets/RPC in DSR where return traffic bypasses the NLB completely).
-- **1,000,000,000 RPS global footprint**: ~**4–6 active 64-core edge nodes per major region across 10–20 Anycast PoPs** (with 2× N+1 DDoS headroom) behind BGP ECMP routers sharing deterministic Maglev tables + ExaBGP health withdrawal.
+- **Per-core measured DSR IPIP packet budget**: `~82 Mpps` (userspace UMEM); accounting for real Linux NIC PCIe/DMA overhead (~20-30 Mpps/core on 100G/200G ConnectX-6/7 with `AF_XDP` zero-copy + RSS), a single 64-core L4 edge node sustains **~1.2-1.5 Bpps / ~250-400M RPS** (at ~3-5 packets/RPC in DSR where return traffic bypasses the NLB completely).
+- **1,000,000,000 RPS global footprint**: ~**4-6 active 64-core edge nodes per major region across 10-20 Anycast PoPs** (with 2x N+1 DDoS headroom) behind BGP ECMP routers sharing deterministic Maglev tables + ExaBGP health withdrawal.
 
 ---
 
@@ -179,9 +179,9 @@ Weights range from `0` (soft-drain: no new flows) to `1000` (proportional share 
   --algo p2c
 ```
 
-- `127.0.0.1:9001` — static IPv4, default weight `1`
-- `127.0.0.1:9001@5` (or `@w=5`) — static IPv4, weight `5`
-- `api.internal:8080@3` or `dns://svc.cluster.local:8080@10` — background DNS subscription (resolves all IPv4 A records, auto-registers new IPs, gracefully drains removed IPs, and keeps last-known-good IPs if DNS transiently fails)
+- `127.0.0.1:9001`: static IPv4, default weight `1`
+- `127.0.0.1:9001@5` (or `@w=5`): static IPv4, weight `5`
+- `api.internal:8080@3` or `dns://svc.cluster.local:8080@10`: background DNS subscription (resolves all IPv4 A records, auto-registers new IPs, gracefully drains removed IPs, and keeps last-known-good IPs if DNS transiently fails)
 
 ### 2. Live HTTP/JSON Control Plane (`--admin <ip:port>`)
 
