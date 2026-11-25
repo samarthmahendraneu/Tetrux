@@ -134,6 +134,69 @@ Measured on **Apple M3 Pro (11 cores: 5 P-cores + 6 E-cores, 128B L1 cache lines
 - **Peak pooled backpressure buffers leased:** `0`
 - **Isolated NLB Idle CPU with 1,000 open connections:** **`0.26%`**
 
+### Suite 8 — Live Control Plane, DNS, Weight Tuning & Graceful Drain (`--suite control`)
+
+- Registered static IP (`weight=1`) + `localhost` DNS target (`weight=1`) → **50.0% / 50.0%** exact connection split
+- Live-tuned weight via `PUT /targets/weight` (`4:1`, zero restart, zero dataplane lock) → **80.0% / 20.0%** (`+160 / +40` conns)
+- Deregistered DNS target with `drain: true` → **0 new connections** routed to drained target while active held stream stayed alive cleanly
+
+---
+
+## Registering, Deregistering, DNS & Weight Tuning
+
+### 1. Startup CLI Target Syntax (Static IPv4, DNS & Inline Weights)
+
+Weights range from `0` (soft-drain: no new flows) to `1000` (proportional share across **Maglev**, **Weighted P2C**, and **Smooth Weighted Round-Robin**):
+
+```bash
+./target/release/tetrux \
+  --mode tcp \
+  --listen 127.0.0.1:8080 \
+  --backends 127.0.0.1:9001@5,127.0.0.1:9002@3,api.internal:9003@2 \
+  --admin 127.0.0.1:9090 \
+  --dns-refresh-secs 10 \
+  --workers 4 \
+  --algo p2c
+```
+
+- `127.0.0.1:9001` — static IPv4, default weight `1`
+- `127.0.0.1:9001@5` (or `@w=5`) — static IPv4, weight `5`
+- `api.internal:8080@3` or `dns://svc.cluster.local:8080@10` — background DNS subscription (resolves all IPv4 A records, auto-registers new IPs, gracefully drains removed IPs, and keeps last-known-good IPs if DNS transiently fails)
+
+### 2. Live HTTP/JSON Control Plane (`--admin <ip:port>`)
+
+All mutations rebuild an immutable routing snapshot off the dataplane and atomically bump `generation` (zero worker locks).
+
+| Action | Method & Path | Input JSON | Output JSON |
+|---|---|---|---|
+| **Register IP target** | `POST /targets` | `{"addr":"127.0.0.1:9004","weight":5}` *(optional `"mac"` for DSR)* | `{"status":"registered","endpoint":"127.0.0.1:9004","slot_id":3,"weight":5,"generation":4}` |
+| **Register DNS pool** | `POST /targets` | `{"dns":"api.internal:8080","weight":3}` | `{"status":"registered_dns","dns":"api.internal:8080","weight":3,"resolved":["10.0.1.10:8080"],"added":1,"drained":0,"generation":5}` |
+| **Tune weight live** | `PUT /targets/weight` | `{"addr":"127.0.0.1:9001","weight":10}` or `{"dns":"api.internal:8080","weight":0}` | `{"status":"updated","endpoint":"127.0.0.1:9001","slot_id":0,"weight":10,"generation":6}` |
+| **Deregister / drain** | `DELETE /targets` | `{"addr":"127.0.0.1:9002","drain":true}` or `{"dns":"api.internal:8080","drain":true}` | `{"status":"draining","endpoint":"127.0.0.1:9002","slot_id":1,"active_conns":4,"generation":7}` |
+| **Force DNS refresh** | `POST /dns/refresh` | *(empty)* | `{"status":"refreshed","changes":1,"generation":8}` |
+| **List targets & shares** | `GET /targets` | *(empty)* | `{"generation":8,"algorithm":"P2cLeastConn","targets":[...],"dns_subscriptions":[...]}` |
+| **Live metrics** | `GET /stats` | *(empty)* | `{"mode":"tcp","active_conns":...,"fast_path_pct":...,"nlb_cpu_ms":...,"rss_mib":...}` |
+| **Health check** | `GET /health` | *(empty)* | `{"status":"ok","generation":8,"targets":3}` |
+
+#### Quick `curl` Examples
+```bash
+# Register a canary backend with weight 1
+curl -s -X POST http://127.0.0.1:9090/targets -d '{"addr":"127.0.0.1:9004","weight":1}'
+
+# Register a multi-A-record DNS service pool
+curl -s -X POST http://127.0.0.1:9090/targets -d '{"dns":"backends.internal:8080","weight":4}'
+
+# Shift canary traffic up to weight 8 live (zero dropped connections)
+curl -s -X PUT http://127.0.0.1:9090/targets/weight -d '{"addr":"127.0.0.1:9004","weight":8}'
+
+# Gracefully drain & deregister an old backend (in-flight TCP streams finish cleanly)
+curl -s -X DELETE http://127.0.0.1:9090/targets -d '{"addr":"127.0.0.1:9001","drain":true}'
+
+# Inspect live targets, effective share %, health, DNS pools & stats
+curl -s http://127.0.0.1:9090/targets
+curl -s http://127.0.0.1:9090/stats
+```
+
 ---
 
 ## Building & Running
@@ -148,29 +211,33 @@ cargo test
 cargo build --release
 ```
 
-### Run the Full 7-Suite Benchmark
+### Run the Benchmark Suite
 ```bash
 ./target/release/tetrux-bench --suite all
-# Or run individual suites: bypass | tcp | rpc | mixed | burst | udp | memory
+# Or run individual suites: bypass | tcp | rpc | mixed | burst | udp | memory | control
 ./target/release/tetrux-bench --suite bypass
+./target/release/tetrux-bench --suite control
 ```
 
 ### Run Tetrux L4 Load Balancer CLI
 ```bash
-# TCP L4 NLB (P2C least-connections + EWMA, 4 P-core workers, adaptive busy-poll)
+# TCP L4 NLB with live HTTP control plane, weighted backends, and DNS discovery
 ./target/release/tetrux \
   --mode tcp \
   --listen 127.0.0.1:8080 \
-  --backends 127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003 \
+  --backends 127.0.0.1:9001@5,127.0.0.1:9002@3,localhost:9003@2 \
+  --admin 127.0.0.1:9090 \
+  --dns-refresh-secs 10 \
   --workers 4 \
   --algo p2c \
   --busy-poll-us 150 \
   --work-budget 65536
 
-# Batched UDP L4 NLB (Maglev consistent hashing + recvmsg_x/sendmsg_x)
+# Batched UDP L4 NLB (Weighted Maglev + recvmsg_x/sendmsg_x)
 ./target/release/tetrux \
   --mode udp \
   --listen 127.0.0.1:8053 \
-  --backends 127.0.0.1:9053,127.0.0.1:9054 \
+  --backends 127.0.0.1:9053@3,127.0.0.1:9054@1 \
+  --admin 127.0.0.1:9091 \
   --algo maglev
 ```
