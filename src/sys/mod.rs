@@ -5,6 +5,8 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod signal;
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]

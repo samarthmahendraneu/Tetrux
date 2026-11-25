@@ -3,3 +3,4 @@ pub mod conntrack;
 pub mod dns;
 pub mod hash;
 pub mod maglev;
+pub mod ratelimit;
