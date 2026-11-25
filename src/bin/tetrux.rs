@@ -4,19 +4,28 @@ use std::net::SocketAddrV4;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tetrux::control::{start_control_plane, StatsProvider};
 use tetrux::engine::tcp::{start_tcp_nlb, AcceptStrategy, TcpEngineConfig};
 use tetrux::engine::udp::{start_udp_nlb, UdpEngineConfig};
 use tetrux::lb::balancer::{BackendPool, BackendSpec, LbAlgorithm};
+use tetrux::lb::dns::{DnsManager, TargetInput};
 use tetrux::sys::{self, EndpointV4};
 
 fn print_usage() {
     eprintln!(
         "Tetrux L4 Network Load Balancer\n\
          Usage:\n\
-         \ttetrux --mode <tcp|udp> --listen <ip:port> --backends <ip:port,ip:port,...> [options]\n\n\
+         \ttetrux --mode <tcp|udp> --listen <ip:port> [--backends <spec,...>] [options]\n\n\
+         Target Specs (comma-separated in --backends or live via --admin API):\n\
+         \t127.0.0.1:9001              Static IPv4 target (default weight = 1)\n\
+         \t127.0.0.1:9001@5            Static IPv4 target with weight = 5\n\
+         \tapi.internal:8080@3         DNS target (resolves all A records, weight = 3)\n\
+         \tdns://svc.local:8080@10     Explicit DNS pool subscription\n\n\
          Options:\n\
+         \t--admin <ip:port>      Enable live HTTP/JSON control plane (e.g. 127.0.0.1:9090)\n\
+         \t--dns-refresh-secs <S> Background DNS re-resolution interval (default: 10; 0 = off)\n\
          \t--workers <N>          Worker threads (default: 4)\n\
-         \t--algo <maglev|p2c|rr> Balancing algorithm (default: p2c)\n\
+         \t--algo <maglev|p2c|rr> Weighted balancing algorithm (default: p2c)\n\
          \t--busy-poll-us <US>    Adaptive busy-poll window in us (default: 150; 0 = interrupt)\n\
          \t--work-budget <BYTES>  Fair per-turn byte budget per conn (default: 65536)\n\
          \t--max-conns <N>        Max connections per worker (default: 4096)\n\
@@ -44,6 +53,8 @@ fn main() {
     let mut mode = "tcp".to_string();
     let mut listen_str = "127.0.0.1:8080".to_string();
     let mut backends_str = String::new();
+    let mut admin_str: Option<String> = None;
+    let mut dns_refresh_secs: u64 = 10;
     let mut workers: usize = 4;
     let mut algo = LbAlgorithm::P2cLeastConn;
     let mut busy_poll_us: u64 = 150;
@@ -68,6 +79,14 @@ fn main() {
             "--backends" => {
                 i += 1;
                 backends_str = args.get(i).cloned().unwrap_or_default();
+            }
+            "--admin" => {
+                i += 1;
+                admin_str = args.get(i).cloned();
+            }
+            "--dns-refresh-secs" => {
+                i += 1;
+                dns_refresh_secs = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(10);
             }
             "--workers" => {
                 i += 1;
@@ -112,8 +131,8 @@ fn main() {
         i += 1;
     }
 
-    if backends_str.is_empty() {
-        eprintln!("Error: --backends is required");
+    if backends_str.is_empty() && admin_str.is_none() {
+        eprintln!("Error: provide --backends and/or --admin (to register targets dynamically)");
         print_usage();
         std::process::exit(1);
     }
@@ -123,25 +142,49 @@ fn main() {
         std::process::exit(1);
     });
 
-    let backends: Vec<BackendSpec> = backends_str
-        .split(',')
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            let ep = parse_ep(s.trim()).unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            });
-            BackendSpec::new(ep)
-        })
-        .collect();
-
     let nofile = sys::raise_nofile_limit(16_384);
-    let pool = BackendPool::new(backends.clone(), algo);
-    let running = Arc::new(AtomicBool::new(true));
+    let pool = BackendPool::new(Vec::new(), algo);
+    let dns = DnsManager::new(Arc::clone(&pool));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Register initial static IPv4 & DNS targets (with weights!)
+    for raw in backends_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match TargetInput::parse(raw) {
+            Ok(TargetInput::StaticIp { endpoint, weight }) => {
+                pool.register_target(BackendSpec::new(endpoint).with_weight(weight));
+            }
+            Ok(TargetInput::Dns {
+                host,
+                port,
+                weight,
+                ..
+            }) => match dns.register_dns(&host, port, weight) {
+                Ok(rep) => {
+                    println!(
+                        "DNS target '{}' resolved -> {:?} (weight={weight})",
+                        rep.key, rep.resolved
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Warning: initial DNS resolve failed for {host}:{port}: {e}");
+                }
+            },
+            Err(e) => {
+                eprintln!("Invalid backend spec '{raw}': {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let _dns_thread = if dns_refresh_secs > 0 {
+        Some(dns.spawn_refresher(Duration::from_secs(dns_refresh_secs), Arc::clone(&stop)))
+    } else {
+        None
+    };
 
     println!(
-        "Tetrux L4 NLB starting | mode={mode} listen={listen_addr} backends={} workers={workers} algo={algo:?} busy_poll_us={busy_poll_us} nofile={nofile}",
-        backends.len()
+        "Tetrux L4 NLB starting | mode={mode} listen={listen_addr} targets={} workers={workers} algo={algo:?} busy_poll_us={busy_poll_us} nofile={nofile}",
+        pool.list_targets().len()
     );
 
     match mode.as_str() {
@@ -163,14 +206,31 @@ fn main() {
                 None
             };
 
-            let handle = start_tcp_nlb(cfg, pool).expect("failed to start TCP NLB");
+            let handle = Arc::new(start_tcp_nlb(cfg, Arc::clone(&pool)).expect("failed to start TCP NLB"));
+            let _admin = admin_str.as_ref().map(|addr_s| {
+                let ep = parse_ep(addr_s).expect("invalid --admin endpoint");
+                let h = Arc::clone(&handle);
+                let cp = start_control_plane(
+                    ep,
+                    Arc::clone(&pool),
+                    Arc::clone(&dns),
+                    StatsProvider::Tcp(Box::new(move || h.stats())),
+                    Arc::clone(&stop),
+                )
+                .expect("failed to start control plane");
+                println!("Admin HTTP/JSON Control Plane listening on http://{}", cp.bound_addr());
+                cp
+            });
+
             println!("Listening on TCP {}", handle.bound_addr());
-            while running.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(stats_secs.max(1)));
                 let s = handle.stats();
                 let m = sys::sample_process_metrics();
                 println!(
-                    "[stats] active={} accepted={} rejected={} c2b={:.2}MiB b2c={:.2}MiB fast_wr={} buf_wr={} polls={} events/poll={:.2} rss={:.2}MiB",
+                    "[stats] gen={} targets={} active={} accepted={} rejected={} c2b={:.2}MiB b2c={:.2}MiB fast_wr={} buf_wr={} rss={:.2}MiB",
+                    pool.generation(),
+                    pool.list_targets().len(),
                     s.active,
                     s.accepted,
                     s.rejected,
@@ -178,8 +238,6 @@ fn main() {
                     s.bytes_b2c as f64 / (1024.0 * 1024.0),
                     s.fast_path_writes,
                     s.buffered_writes,
-                    s.poll_calls,
-                    if s.poll_calls > 0 { s.poll_events as f64 / s.poll_calls as f64 } else { 0.0 },
                     m.current_rss_bytes as f64 / (1024.0 * 1024.0),
                 );
             }
@@ -189,18 +247,34 @@ fn main() {
             cfg.listen_addr = listen_addr;
             cfg.batched = batched_udp;
             cfg.busy_poll_us = busy_poll_us;
-            let handle = start_udp_nlb(cfg, pool).expect("failed to start UDP NLB");
+            let handle = Arc::new(start_udp_nlb(cfg, Arc::clone(&pool)).expect("failed to start UDP NLB"));
+            let _admin = admin_str.as_ref().map(|addr_s| {
+                let ep = parse_ep(addr_s).expect("invalid --admin endpoint");
+                let h = Arc::clone(&handle);
+                let cp = start_control_plane(
+                    ep,
+                    Arc::clone(&pool),
+                    Arc::clone(&dns),
+                    StatsProvider::Udp(Box::new(move || h.stats())),
+                    Arc::clone(&stop),
+                )
+                .expect("failed to start control plane");
+                println!("Admin HTTP/JSON Control Plane listening on http://{}", cp.bound_addr());
+                cp
+            });
             println!(
                 "Listening on UDP {} (batched={})",
                 handle.bound_addr(),
                 batched_udp
             );
-            while running.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(stats_secs.max(1)));
                 let s = handle.stats();
                 let m = sys::sample_process_metrics();
                 println!(
-                    "[udp] rx_pkts={} tx_pkts={} pkts/syscall={:.2} drops={} sessions={} rss={:.2}MiB",
+                    "[udp] gen={} targets={} rx_pkts={} tx_pkts={} pkts/syscall={:.2} drops={} sessions={} rss={:.2}MiB",
+                    pool.generation(),
+                    pool.list_targets().len(),
                     s.rx_packets,
                     s.tx_packets,
                     s.pkts_per_syscall(),

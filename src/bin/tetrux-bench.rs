@@ -17,6 +17,7 @@ use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use tetrux::control::{start_control_plane, StatsProvider};
 use tetrux::engine::bypass::{
     build_test_ipv4_packet, create_bypass_queue_pair, read_bypass_stats, BypassConfig,
     BypassCounters, BypassForwardMode, BypassWorker, PacketDesc, UmemArena, BURST_SIZE,
@@ -24,6 +25,7 @@ use tetrux::engine::bypass::{
 use tetrux::engine::tcp::{start_tcp_nlb, TcpEngineConfig};
 use tetrux::engine::udp::{start_udp_nlb, UdpEngineConfig};
 use tetrux::lb::balancer::{BackendPool, BackendSpec, LbAlgorithm};
+use tetrux::lb::dns::DnsManager;
 use tetrux::mem::cache::CachePadded;
 use tetrux::metrics::alloc_tracker::{AllocSnapshot, CountingAllocator};
 use tetrux::metrics::histogram::LatencyHistogram;
@@ -1326,6 +1328,160 @@ fn suite_7_memory_footprint(backends: &[EndpointV4], nofile_limit: u64) {
     nlb.stop();
 }
 
+// ============================================================================
+// Suite 8: Live Control Plane — Dynamic Register, Weight Tuning, DNS & Graceful Drain
+// ============================================================================
+
+fn http_call(admin: EndpointV4, method: &str, path: &str, body: &str) -> String {
+    let mut s = TcpStream::connect(admin.to_std()).expect("admin connect failed");
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    let _ = s.read_to_string(&mut resp);
+    resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+}
+
+fn suite_8_control_plane_and_weights(backends: &[EndpointV4]) {
+    println!("\n==================================================================================================================================");
+    println!("SUITE 8: LIVE CONTROL PLANE — DYNAMIC REGISTER, WEIGHT TUNING (1:1 -> 4:1), DNS, & GRACEFUL DRAIN");
+    println!("==================================================================================================================================");
+
+    let pool = BackendPool::new(Vec::new(), LbAlgorithm::RoundRobin);
+    let dns = DnsManager::new(Arc::clone(&pool));
+    let mut cfg = TcpEngineConfig::default();
+    cfg.workers = 2;
+    cfg.busy_poll_us = 100;
+    let nlb = Arc::new(start_tcp_nlb(cfg, Arc::clone(&pool)).unwrap());
+    let stop_cp = Arc::new(AtomicBool::new(false));
+    let nlb_stats = Arc::clone(&nlb);
+    let admin = start_control_plane(
+        EndpointV4::from_octets(127, 0, 0, 1, 0),
+        Arc::clone(&pool),
+        Arc::clone(&dns),
+        StatsProvider::Tcp(Box::new(move || nlb_stats.stats())),
+        Arc::clone(&stop_cp),
+    )
+    .unwrap();
+    let admin_ep = admin.bound_addr();
+    let nlb_ep = nlb.bound_addr();
+
+    // 1. Register backend[0] via static IP (weight=1) and backend[1] via DNS localhost (weight=1)
+    let r1 = http_call(
+        admin_ep,
+        "POST",
+        "/targets",
+        &format!(r#"{{"addr":"{}","weight":1}}"#, backends[0]),
+    );
+    let r2 = http_call(
+        admin_ep,
+        "POST",
+        "/targets",
+        &format!(r#"{{"dns":"localhost:{}","weight":1}}"#, backends[1].port),
+    );
+    println!("  Register static : {r1}");
+    println!("  Register DNS    : {r2}");
+
+    // Send 100 short TCP connections -> verify ~50 / 50 split
+    for _ in 0..100 {
+        let mut s = TcpStream::connect(nlb_ep.to_std()).unwrap();
+        s.write_all(b"ping").unwrap();
+        let mut b = [0u8; 4];
+        s.read_exact(&mut b).unwrap();
+    }
+    let t_before: Vec<_> = pool.list_targets();
+    println!(
+        "  Phase 1 (1:1)   : {} total_conns={} (share={:.1}%) | {} total_conns={} (share={:.1}%)",
+        t_before[0].endpoint,
+        t_before[0].total_conns,
+        t_before[0].effective_share_pct,
+        t_before[1].endpoint,
+        t_before[1].total_conns,
+        t_before[1].effective_share_pct,
+    );
+
+    // 2. Live tune weight: backend[0] -> 4, backend[1] (DNS) -> 1 (expected 80% / 20%)
+    let rw = http_call(
+        admin_ep,
+        "PUT",
+        "/targets/weight",
+        &format!(r#"{{"addr":"{}","weight":4}}"#, backends[0]),
+    );
+    println!("  Tune weight 4:1 : {rw}");
+    let c0_prev = t_before[0].total_conns;
+    let c1_prev = t_before[1].total_conns;
+
+    for _ in 0..200 {
+        let mut s = TcpStream::connect(nlb_ep.to_std()).unwrap();
+        s.write_all(b"ping").unwrap();
+        let mut b = [0u8; 4];
+        s.read_exact(&mut b).unwrap();
+    }
+    let t_after = pool.list_targets();
+    let d0 = t_after[0].total_conns - c0_prev;
+    let d1 = t_after[1].total_conns - c1_prev;
+    println!(
+        "  Phase 2 (4:1)   : {} +{d0} conns ({:.1}%) | {} +{d1} conns ({:.1}%)",
+        t_after[0].endpoint,
+        d0 as f64 * 100.0 / (d0 + d1) as f64,
+        t_after[1].endpoint,
+        d1 as f64 * 100.0 / (d0 + d1) as f64,
+    );
+
+    // 3. Hold an active connection open, deregister backend[1] with drain=true, verify 0 new traffic hits it!
+    let mut held = TcpStream::connect(nlb_ep.to_std()).unwrap();
+    held.write_all(b"hold").unwrap();
+    let mut hb = [0u8; 4];
+    held.read_exact(&mut hb).unwrap();
+
+    let rd = http_call(
+        admin_ep,
+        "DELETE",
+        "/targets",
+        &format!(r#"{{"dns":"localhost:{}","drain":true}}"#, backends[1].port),
+    );
+    println!("  Deregister DNS  : {rd}");
+    let c1_drain_base = pool
+        .list_targets()
+        .iter()
+        .find(|t| t.endpoint == backends[1])
+        .map(|t| t.total_conns)
+        .unwrap_or(t_after[1].total_conns);
+
+    for _ in 0..50 {
+        let mut s = TcpStream::connect(nlb_ep.to_std()).unwrap();
+        s.write_all(b"ping").unwrap();
+        let mut b = [0u8; 4];
+        s.read_exact(&mut b).unwrap();
+    }
+    // Verify held connection still echoes cleanly during drain!
+    held.write_all(b"okay").unwrap();
+    held.read_exact(&mut hb).unwrap();
+    assert_eq!(&hb, b"okay");
+    drop(held);
+
+    let c1_post = pool
+        .list_targets()
+        .iter()
+        .find(|t| t.endpoint == backends[1])
+        .map(|t| t.total_conns)
+        .unwrap_or(c1_drain_base);
+    println!(
+        "  Drain Verified  : new conns to drained target={} (expected 0) | in-flight held stream=OK",
+        c1_post.saturating_sub(c1_drain_base)
+    );
+    println!("  GET /stats      : {}", http_call(admin_ep, "GET", "/stats", ""));
+
+    admin.stop();
+    if let Ok(h) = Arc::try_unwrap(nlb) {
+        h.stop();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let suite_filter = args
@@ -1349,7 +1505,10 @@ fn main() {
         suite_1_kernel_bypass();
     }
 
-    let need_tcp_backends = matches!(suite_filter, "all" | "tcp" | "rpc" | "mixed" | "burst" | "memory");
+    let need_tcp_backends = matches!(
+        suite_filter,
+        "all" | "tcp" | "rpc" | "mixed" | "burst" | "memory" | "control"
+    );
     let backends: Vec<FastTcpBackend> = if need_tcp_backends {
         (0..4).map(FastTcpBackend::start).collect()
     } else {
@@ -1374,6 +1533,9 @@ fn main() {
     }
     if suite_filter == "all" || suite_filter == "memory" {
         suite_7_memory_footprint(&be_eps, nofile);
+    }
+    if suite_filter == "all" || suite_filter == "control" {
+        suite_8_control_plane_and_weights(&be_eps);
     }
 
     for b in backends {
