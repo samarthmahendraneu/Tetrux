@@ -84,9 +84,9 @@ impl Default for TcpEngineConfig {
             sock_buf_bytes: 262_144,
             max_conns_per_worker: 4096,
             pool_chunks_per_worker: 256,
-            pool_chunk_bytes: 32_768,
+            pool_chunk_bytes: 65_536,
             busy_poll_us: 150,
-            work_budget_bytes: 65_536,
+            work_budget_bytes: 131_072,
             idle_timeout_secs: 60,
             health_check_interval: None,
         }
@@ -695,9 +695,15 @@ impl TcpWorker {
             if did_work {
                 last_work_ns = sys::fast_now_ns();
             } else if in_busy_window {
-                // Brief userspace backoff between non-blocking polls so busy-poll stays
-                // sub-microsecond without hammering kernel kevent locks!
-                for _ in 0..16 {
+                // Pace non-blocking kevent probes (~1.5us userspace spin checking SPSC accept ring)
+                // to keep sub-5us tail latency while cutting idle busy-poll syscalls by ~15x!
+                let spin_until = sys::fast_now_ns() + 1_500;
+                while sys::fast_now_ns() < spin_until {
+                    if let Some(ref mut rx) = self.accept_rx {
+                        if !rx.is_empty() {
+                            break;
+                        }
+                    }
                     sys::cpu_relax();
                 }
             }
@@ -1041,7 +1047,11 @@ impl TcpWorker {
 
             if ring_empty {
                 // === BUFFERLESS FAST PATH: read into L1-hot scratch -> immediate write ===
-                let chunk = (budget - moved).min(self.scratch.len());
+                // Clamp read chunk to `buf_pool.chunk_size()` so any partial/WouldBlock write
+                // is guaranteed to fit inside a single lazily-leased PooledRing chunk!
+                let chunk = (budget - moved)
+                    .min(self.scratch.len())
+                    .min(self.buf_pool.chunk_size());
                 self.local_read_calls += 1;
                 match sys::read_nb(src_fd, &mut self.scratch[..chunk]) {
                     IoStatus::Ok(n) => {

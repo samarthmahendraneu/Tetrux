@@ -357,7 +357,8 @@ impl UdpWorker {
                 }
                 last_work_ns = sys::fast_now_ns();
             } else if in_busy {
-                for _ in 0..16 {
+                let spin_until = sys::fast_now_ns() + 1_500;
+                while sys::fast_now_ns() < spin_until {
                     sys::cpu_relax();
                 }
             }

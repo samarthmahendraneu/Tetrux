@@ -9,6 +9,7 @@
 //! 6. L4 UDP Mode-Switch Reduction (recvfrom/sendto vs Darwin recvmsg_x/sendmsg_x Batching)
 //! 7. Low Memory Footprint & Idle Scaling (1,000 Concurrent Connections RSS & CPU)
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,7 +21,7 @@ use tetrux::engine::bypass::{
     build_test_ipv4_packet, create_bypass_queue_pair, read_bypass_stats, BypassConfig,
     BypassCounters, BypassForwardMode, BypassWorker, PacketDesc, UmemArena, BURST_SIZE,
 };
-use tetrux::engine::tcp::{start_tcp_nlb, AcceptStrategy, TcpEngineConfig};
+use tetrux::engine::tcp::{start_tcp_nlb, TcpEngineConfig};
 use tetrux::engine::udp::{start_udp_nlb, UdpEngineConfig};
 use tetrux::lb::balancer::{BackendPool, BackendSpec, LbAlgorithm};
 use tetrux::mem::cache::CachePadded;
@@ -59,7 +60,8 @@ impl FastTcpBackend {
                 poller.add_read(lfd, u64::MAX, false);
                 let mut events = Vec::with_capacity(512);
                 let mut scratch = vec![0u8; 65536];
-                let mut fds: Vec<sys::Fd> = Vec::new();
+                // Per-FD pending echo buffer (offset, buf) so backpressure NEVER stalls other conns!
+                let mut pending: HashMap<sys::Fd, (usize, Vec<u8>)> = HashMap::new();
                 while !stop_c.load(Ordering::Relaxed) {
                     let n = poller.poll(&mut events, Some(10_000_000)).unwrap_or(0);
                     if n == 0 {
@@ -75,7 +77,7 @@ impl FastTcpBackend {
                                 match sys::accept_nonblock(lfd, false) {
                                     Ok(Some((cfd, _))) => {
                                         poller.add_read(cfd, cfd as u64, false);
-                                        fds.push(cfd);
+                                        pending.insert(cfd, (0, Vec::new()));
                                     }
                                     _ => break,
                                 }
@@ -83,43 +85,97 @@ impl FastTcpBackend {
                         } else {
                             let fd = ev.token as sys::Fd;
                             if ev.error {
+                                pending.remove(&fd);
                                 sys::close_fd(fd);
                                 continue;
                             }
-                            loop {
-                                match sys::read_nb(fd, &mut scratch) {
-                                    IoStatus::Ok(r) => {
-                                        let mut off = 0;
-                                        let mut dead = false;
-                                        while off < r {
-                                            match sys::write_nb(fd, &scratch[off..r]) {
-                                                IoStatus::Ok(w) => off += w,
-                                                IoStatus::WouldBlock => sys::cpu_relax(),
-                                                _ => {
-                                                    dead = true;
+                            if ev.writable {
+                                let mut close = false;
+                                if let Some((off, buf)) = pending.get_mut(&fd) {
+                                    while *off < buf.len() {
+                                        match sys::write_nb(fd, &buf[*off..]) {
+                                            IoStatus::Ok(w) if w > 0 => *off += w,
+                                            IoStatus::Ok(_) | IoStatus::WouldBlock => {
+                                                poller.arm_write_oneshot(fd, fd as u64);
+                                                break;
+                                            }
+                                            _ => {
+                                                close = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !close && *off >= buf.len() {
+                                        buf.clear();
+                                        *off = 0;
+                                        poller.enable_read(fd, fd as u64);
+                                    }
+                                }
+                                if close {
+                                    pending.remove(&fd);
+                                    sys::close_fd(fd);
+                                    continue;
+                                }
+                            }
+                            if ev.readable || ev.eof {
+                                let has_pending = pending
+                                    .get(&fd)
+                                    .map(|(off, buf)| *off < buf.len())
+                                    .unwrap_or(false);
+                                if has_pending {
+                                    poller.disable_read(fd);
+                                    continue;
+                                }
+                                let mut close = false;
+                                for _ in 0..4 {
+                                    match sys::read_nb(fd, &mut scratch) {
+                                        IoStatus::Ok(r) => match sys::write_nb(fd, &scratch[..r]) {
+                                            IoStatus::Ok(w) if w == r => {
+                                                if r < scratch.len() {
                                                     break;
                                                 }
                                             }
-                                        }
-                                        if dead {
-                                            sys::close_fd(fd);
-                                            break;
-                                        }
-                                        if r < scratch.len() {
+                                            IoStatus::Ok(w) => {
+                                                if let Some((off, buf)) = pending.get_mut(&fd) {
+                                                    *off = 0;
+                                                    buf.clear();
+                                                    buf.extend_from_slice(&scratch[w..r]);
+                                                    poller.arm_write_oneshot(fd, fd as u64);
+                                                    poller.disable_read(fd);
+                                                }
+                                                break;
+                                            }
+                                            IoStatus::WouldBlock => {
+                                                if let Some((off, buf)) = pending.get_mut(&fd) {
+                                                    *off = 0;
+                                                    buf.clear();
+                                                    buf.extend_from_slice(&scratch[..r]);
+                                                    poller.arm_write_oneshot(fd, fd as u64);
+                                                    poller.disable_read(fd);
+                                                }
+                                                break;
+                                            }
+                                            _ => {
+                                                close = true;
+                                                break;
+                                            }
+                                        },
+                                        IoStatus::WouldBlock => break,
+                                        IoStatus::Eof | IoStatus::Error(_) => {
+                                            close = true;
                                             break;
                                         }
                                     }
-                                    IoStatus::WouldBlock => break,
-                                    IoStatus::Eof | IoStatus::Error(_) => {
-                                        sys::close_fd(fd);
-                                        break;
-                                    }
+                                }
+                                if close {
+                                    pending.remove(&fd);
+                                    sys::close_fd(fd);
                                 }
                             }
                         }
                     }
                 }
-                for fd in fds {
+                for (fd, _) in pending.drain() {
                     sys::close_fd(fd);
                 }
                 sys::close_fd(lfd);
@@ -303,6 +359,7 @@ fn run_bypass_single(
     payload_bytes: usize,
     pkts_per_worker: u64,
     num_flows: usize,
+    inflight_cap: usize,
     micro_burst_waves: Option<(usize, usize)>, // (waves, pkts_per_wave)
 ) {
     let backends = vec![
@@ -317,15 +374,19 @@ fn run_bypass_single(
     ];
     let pool = BackendPool::new(backends, LbAlgorithm::Maglev);
     let ring_size = 4096usize;
-    let frames_per_worker = 4096usize;
+    let frames_per_worker = inflight_cap.clamp(64, 4096);
 
     let mut cfg = BypassConfig::default();
     cfg.mode = mode;
     cfg.conntrack_capacity = 65_536;
 
-    // Pre-allocate all UMEM arenas, rings, and workers BEFORE measuring allocations & timing!
+    // Two-barrier handshake:
+    // - `setup_barrier`: every thread has completed 100% of startup allocations
+    // - `go_barrier`: main snapshots AllocSnapshot::now() = 0 hot-path allocs proof!
     let stop = Arc::new(AtomicBool::new(false));
-    let start_barrier = Arc::new(Barrier::new(workers * 2 + 1));
+    let setup_barrier = Arc::new(Barrier::new(workers * 2 + 1));
+    let go_barrier = Arc::new(Barrier::new(workers * 2 + 1));
+    let done_barrier = Arc::new(Barrier::new(workers + 1));
     let mut lb_threads = Vec::with_capacity(workers);
     let mut nic_threads = Vec::with_capacity(workers);
     let mut all_counters = Vec::with_capacity(workers);
@@ -334,12 +395,11 @@ fn run_bypass_single(
     let sample_pkt_len = 14 + 20 + 20 + payload_bytes;
 
     for w in 0..workers {
-        let umem = UmemArena::new(frames_per_worker).unwrap();
+        let umem = UmemArena::new(4096).unwrap();
         let (mut nic, lb) = create_bypass_queue_pair(ring_size);
         let counters = Arc::new(CachePadded::new(BypassCounters::default()));
         all_counters.push(Arc::clone(&counters));
 
-        // Pre-populate all 4096 UMEM frames with valid Ethernet+IPv4+TCP packets across `num_flows` flows!
         for f in 0..frames_per_worker {
             let flow_id = ((w * 4096) + f) % num_flows;
             let src_ip = 0x0a00_0001u32.wrapping_add((flow_id as u32) >> 10);
@@ -369,19 +429,23 @@ fn run_bypass_single(
             Arc::clone(&counters),
         );
         let stop_lb = Arc::clone(&stop);
-        let bar_lb = Arc::clone(&start_barrier);
+        let sbar_lb = Arc::clone(&setup_barrier);
+        let gbar_lb = Arc::clone(&go_barrier);
         lb_threads.push(
             std::thread::Builder::new()
                 .name(format!("bypass-lb-{w}"))
                 .spawn(move || {
-                    bar_lb.wait();
+                    sbar_lb.wait();
+                    gbar_lb.wait();
                     worker.run_pmd_loop(lb, stop_lb);
                 })
                 .unwrap(),
         );
 
         let umem_nic = Arc::clone(&umem);
-        let bar_nic = Arc::clone(&start_barrier);
+        let sbar_nic = Arc::clone(&setup_barrier);
+        let gbar_nic = Arc::clone(&go_barrier);
+        let dbar_nic = Arc::clone(&done_barrier);
         nic_threads.push(
             std::thread::Builder::new()
                 .name(format!("bypass-nic-{w}"))
@@ -393,14 +457,14 @@ fn run_bypass_single(
                         .collect();
                     let mut rx_batch = [PacketDesc::default(); BURST_SIZE];
                     let mut tx_batch = [PacketDesc::default(); BURST_SIZE];
-                    bar_nic.wait();
+                    sbar_nic.wait();
+                    gbar_nic.wait();
 
                     if let Some((waves, pkts_per_wave)) = micro_burst_waves {
                         for _wave in 0..waves {
                             let mut sent = 0usize;
                             let mut recvd = 0usize;
                             while recvd < pkts_per_wave {
-                                // Blast burst into RX ring
                                 let mut to_send = 0usize;
                                 while to_send < BURST_SIZE && sent < pkts_per_wave {
                                     if let Some(addr) = free_frames.pop() {
@@ -419,7 +483,6 @@ fn run_bypass_single(
                                 }
                                 if to_send > 0 {
                                     let p = nic.rx_tx_to_lb.push_batch(&tx_batch[..to_send]);
-                                    // Return unpushed descriptors to free stack
                                     for d in &tx_batch[p..to_send] {
                                         free_frames.push(d.addr);
                                         sent -= 1;
@@ -440,17 +503,17 @@ fn run_bypass_single(
                             }
                         }
                     } else {
-                        // Sustained max-throughput run
                         let target = pkts_per_worker;
                         let mut sent = 0u64;
                         let mut recvd = 0u64;
                         let mut sample_ctr = 0u64;
+                        let batch_lim = BURST_SIZE.min(frames_per_worker);
                         while recvd < target {
                             let mut to_send = 0usize;
-                            while to_send < BURST_SIZE && sent < target {
+                            while to_send < batch_lim && sent < target {
                                 if let Some(addr) = free_frames.pop() {
-                                    // Stamp timestamp every 8th batch to avoid clock skewing throughput
-                                    if (sample_ctr & 0x7) == 0 && to_send == 0 {
+                                    let stamp = (sample_ctr & 0x7) == 0 && to_send == 0;
+                                    if stamp {
                                         unsafe {
                                             umem_nic.write_headroom_ts(addr, sys::fast_now_ns())
                                         };
@@ -458,11 +521,7 @@ fn run_bypass_single(
                                     tx_batch[to_send] = PacketDesc {
                                         addr,
                                         len: sample_pkt_len as u32,
-                                        options: if (sample_ctr & 0x7) == 0 && to_send == 0 {
-                                            1
-                                        } else {
-                                            0
-                                        },
+                                        options: if stamp { 1 } else { 0 },
                                     };
                                     to_send += 1;
                                     sent += 1;
@@ -493,26 +552,29 @@ fn run_bypass_single(
                             }
                         }
                     }
+                    dbar_nic.wait();
                     hist
                 })
                 .unwrap(),
         );
     }
 
-    // Wait for all threads to finish setup, then snapshot allocs & rusage cleanly!
+    // All threads finish pre-allocation BEFORE we snapshot AllocSnapshot & RUsage!
+    setup_barrier.wait();
     let alloc_start = AllocSnapshot::now();
     let ru_start = sys::sample_process_metrics();
     let t0 = Instant::now();
-    start_barrier.wait();
+    go_barrier.wait();
+
+    done_barrier.wait();
+    let elapsed = t0.elapsed();
+    let alloc_end = AllocSnapshot::now();
+    let ru_end = sys::sample_process_metrics();
 
     let mut merged_hist = LatencyHistogram::new();
     for t in nic_threads {
         merged_hist.merge(&t.join().unwrap());
     }
-    let elapsed = t0.elapsed();
-    let alloc_end = AllocSnapshot::now();
-    let ru_end = sys::sample_process_metrics();
-
     stop.store(true, Ordering::Release);
     for t in lb_threads {
         let _ = t.join();
@@ -520,19 +582,14 @@ fn run_bypass_single(
 
     let mut total_pkts = 0u64;
     let mut total_drops = 0u64;
-    let mut total_hits = 0u64;
-    let mut total_misses = 0u64;
     for c in &all_counters {
         let s = read_bypass_stats(c);
         total_pkts += s.tx_packets;
         total_drops += s.drops;
-        total_hits += s.ct_hits;
-        total_misses += s.ct_misses;
     }
 
     let secs = elapsed.as_secs_f64();
     let mpps = (total_pkts as f64 / secs) / 1_000_000.0;
-    // Wire-rate Gbps includes 20B Ethernet preamble+SFD+IFG per packet (standard RFC 2544)
     let wire_bytes = (sample_pkt_len.max(64) + 20) as f64;
     let wire_gbps = (total_pkts as f64 * wire_bytes * 8.0 / secs) / 1e9;
     let ns_per_pkt = (secs * 1e9 * workers as f64) / total_pkts.max(1) as f64;
@@ -540,7 +597,7 @@ fn run_bypass_single(
     let ru_d = ProcessMetrics::delta(&ru_start, &ru_end);
 
     println!(
-        "  {:<34} | {:6.2} Mpps | {:6.2} Gbps | {:5.1} ns/pkt | lat(ns) p50={:<5} p99={:<6} p99.9={:<6} | allocs={} drops={} vcs={} sys_us={}",
+        "  {:<36} | {:6.2} Mpps | {:7.2} Gbps | {:5.1} ns/pkt | lat(ns) p50={:<5} p99={:<6} p99.9={:<6} | allocs={} drops={} vcs={}",
         label,
         mpps,
         wire_gbps,
@@ -551,22 +608,21 @@ fn run_bypass_single(
         alloc_d.allocs,
         total_drops,
         ru_d.voluntary_ctx_switches,
-        ru_d.sys_time_us,
     );
-    let _ = (total_hits, total_misses);
 }
 
 fn suite_1_kernel_bypass() {
     println!("\n==================================================================================================================================");
     println!("SUITE 1: TRUE KERNEL-BYPASS ZERO-COPY UMEM L4 ENGINE (AF_XDP/DPDK Ring Model — 0 Syscalls, 0 Copies, 0 Heap Allocs)");
     println!("==================================================================================================================================");
-    run_bypass_single("1a. 1-Core NAT (64B wire)", BypassForwardMode::Nat, 1, 10, 4_000_000, 4096, None);
-    run_bypass_single("1b. 1-Core NAT (1024B wire)", BypassForwardMode::Nat, 1, 970, 4_000_000, 4096, None);
-    run_bypass_single("1c. 1-Core DSR (64B wire)", BypassForwardMode::Dsr, 1, 10, 4_000_000, 4096, None);
-    run_bypass_single("1d. 2-Core NAT Scaling (64B)", BypassForwardMode::Nat, 2, 10, 4_000_000, 8192, None);
-    run_bypass_single("1e. 4-Core NAT Scaling (64B)", BypassForwardMode::Nat, 4, 10, 4_000_000, 16384, None);
-    run_bypass_single("1f. 4-Core DSR Scaling (1024B)", BypassForwardMode::Dsr, 4, 970, 4_000_000, 16384, None);
-    run_bypass_single("1g. Micro-Burst (5x40k, 16k flows)", BypassForwardMode::Nat, 1, 10, 0, 16384, Some((5, 40_000)));
+    run_bypass_single("1a. 1-Core NAT (64B wire)", BypassForwardMode::Nat, 1, 10, 4_000_000, 4096, 4096, None);
+    run_bypass_single("1b. 1-Core NAT (1024B wire)", BypassForwardMode::Nat, 1, 970, 4_000_000, 4096, 4096, None);
+    run_bypass_single("1c. 1-Core DSR (64B wire)", BypassForwardMode::Dsr, 1, 10, 4_000_000, 4096, 4096, None);
+    run_bypass_single("1d. 1-Core Low-Queue NAT (64 inflt)", BypassForwardMode::Nat, 1, 10, 1_000_000, 1024, 64, None);
+    run_bypass_single("1e. 2-Core NAT Scaling (64B)", BypassForwardMode::Nat, 2, 10, 4_000_000, 8192, 4096, None);
+    run_bypass_single("1f. 4-Core NAT Scaling (64B)", BypassForwardMode::Nat, 4, 10, 4_000_000, 16384, 4096, None);
+    run_bypass_single("1g. 4-Core DSR Scaling (1024B)", BypassForwardMode::Dsr, 4, 970, 4_000_000, 16384, 4096, None);
+    run_bypass_single("1h. Micro-Burst (5x40k, 16k flows)", BypassForwardMode::Nat, 1, 10, 0, 16384, 4096, Some((5, 40_000)));
 }
 
 // ============================================================================
@@ -715,6 +771,8 @@ fn run_tcp_rpc(
         handles.push(std::thread::spawn(move || {
             let mut s = TcpStream::connect(target.to_std()).expect("rpc connect failed");
             let _ = s.set_nodelay(true);
+            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+            let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
             let req = vec![0x77u8; payload_size];
             let mut resp = vec![0u8; payload_size];
             let mut hist = LatencyHistogram::new();
