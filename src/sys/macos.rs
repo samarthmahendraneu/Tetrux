@@ -65,6 +65,7 @@ const NOTE_TRIGGER: u32 = 0x0100_0000;
 
 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 const RUSAGE_SELF: i32 = 0;
+const RLIMIT_NOFILE: i32 = 8;
 const MACH_TASK_BASIC_INFO: u32 = 20;
 const MACH_TASK_BASIC_INFO_COUNT: u32 = 12;
 const CLOCK_UPTIME_RAW: i32 = 8;
@@ -218,8 +219,17 @@ struct MachTaskBasicInfo {
     suspend_count: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RLimit {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
+
 extern "C" {
     static mach_task_self_: u32;
+    fn getrlimit(resource: i32, rlp: *mut RLimit) -> i32;
+    fn setrlimit(resource: i32, rlp: *const RLimit) -> i32;
 
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     fn bind(fd: i32, addr: *const SockAddrIn, len: u32) -> i32;
@@ -328,6 +338,24 @@ pub fn monotonic_clock_ns() -> u64 {
     (ts.tv_sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec as u64)
+}
+
+/// Raise soft open file-descriptor limit (macOS defaults to 256!) for high-concurrency bursts.
+pub fn raise_nofile_limit(target: u64) -> u64 {
+    let mut rl = RLimit::default();
+    unsafe {
+        if getrlimit(RLIMIT_NOFILE, &mut rl) != 0 {
+            return 256;
+        }
+        // macOS caps OPEN_MAX around 10240 unless kern.maxfilesperproc allows more
+        let desired = target.min(rl.rlim_max).min(10240);
+        if rl.rlim_cur < desired {
+            rl.rlim_cur = desired;
+            let _ = setrlimit(RLIMIT_NOFILE, &rl);
+            let _ = getrlimit(RLIMIT_NOFILE, &mut rl);
+        }
+        rl.rlim_cur
+    }
 }
 
 /// Request Apple Silicon Performance-core (P-core) scheduling via QoS USER_INTERACTIVE.

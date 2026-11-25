@@ -257,6 +257,34 @@ pub fn monotonic_clock_ns() -> u64 {
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
 
+pub fn raise_nofile_limit(target: u64) -> u64 {
+    #[repr(C)]
+    struct RLimit {
+        rlim_cur: u64,
+        rlim_max: u64,
+    }
+    extern "C" {
+        fn getrlimit(resource: i32, rlp: *mut RLimit) -> i32;
+        fn setrlimit(resource: i32, rlp: *const RLimit) -> i32;
+    }
+    let mut rl = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        if getrlimit(7, &mut rl) == 0 {
+            let desired = target.min(rl.rlim_max);
+            if rl.rlim_cur < desired {
+                rl.rlim_cur = desired;
+                let _ = setrlimit(7, &rl);
+                let _ = getrlimit(7, &mut rl);
+            }
+            return rl.rlim_cur;
+        }
+    }
+    1024
+}
+
 pub fn pin_thread_performance(core_id: usize) {
     let mut mask = [0u64; 16];
     let word = (core_id / 64) % 16;
