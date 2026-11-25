@@ -1,0 +1,31 @@
+[package]
+name = "tetrux"
+version = "0.1.0"
+edition = "2021"
+description = "Ultra-low-level L4 Network Load Balancer with syscall batching, adaptive busy-polling, zero-alloc slab pools, and zero-copy kernel-bypass UMEM datapath"
+
+[lib]
+name = "tetrux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tetrux"
+path = "src/bin/tetrux.rs"
+
+[[bin]]
+name = "tetrux-bench"
+path = "src/bin/tetrux-bench.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
