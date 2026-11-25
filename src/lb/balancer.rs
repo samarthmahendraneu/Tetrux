@@ -72,6 +72,7 @@ pub struct SlotRuntime {
     pub total_conns: CachePadded<AtomicU64>,
     pub ewma_connect_ns: CachePadded<AtomicU64>,
     pub consec_failures: CachePadded<AtomicU32>,
+    pub consec_successes: CachePadded<AtomicU32>,
     pub healthy: CachePadded<AtomicBool>,
 }
 
@@ -82,6 +83,7 @@ impl SlotRuntime {
             total_conns: CachePadded::new(AtomicU64::new(0)),
             ewma_connect_ns: CachePadded::new(AtomicU64::new(100_000)),
             consec_failures: CachePadded::new(AtomicU32::new(0)),
+            consec_successes: CachePadded::new(AtomicU32::new(0)),
             healthy: CachePadded::new(AtomicBool::new(true)),
         }
     }
@@ -91,6 +93,7 @@ impl SlotRuntime {
         self.total_conns.store(0, Ordering::Relaxed);
         self.ewma_connect_ns.store(100_000, Ordering::Relaxed);
         self.consec_failures.store(0, Ordering::Relaxed);
+        self.consec_successes.store(0, Ordering::Relaxed);
         self.healthy.store(true, Ordering::Release);
     }
 }
@@ -312,6 +315,10 @@ pub struct BackendPool {
     /// Pre-allocated fixed lock-free runtime atomics directory (never reallocates!).
     runtimes: Box<[SlotRuntime]>,
     generation: CachePadded<AtomicU64>,
+    /// True when unhealthy targets exceed `max_ejection_pct` (fail-open panic mode protects survivors).
+    panic_mode: CachePadded<AtomicBool>,
+    /// Max % of pool allowed to be ejected before panic-mode triggers (default 50%).
+    max_ejection_pct: AtomicU32,
     control: RwLock<ControlState>,
     failure_threshold: u32,
 }
@@ -334,22 +341,46 @@ impl BackendPool {
         }
 
         let runtimes = runtimes_vec.into_boxed_slice();
-        let snapshot = Self::build_snapshot(&slots, &runtimes, 1);
+        let (snapshot, panic) = Self::build_snapshot(&slots, &runtimes, 1, 50);
 
         Arc::new(Self {
             algo,
             runtimes,
             generation: CachePadded::new(AtomicU64::new(1)),
+            panic_mode: CachePadded::new(AtomicBool::new(panic)),
+            max_ejection_pct: AtomicU32::new(50),
             control: RwLock::new(ControlState { slots, snapshot }),
             failure_threshold: 3,
         })
+    }
+
+    #[inline]
+    fn read_control(&self) -> std::sync::RwLockReadGuard<'_, ControlState> {
+        self.control.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[inline]
+    fn write_control(&self) -> std::sync::RwLockWriteGuard<'_, ControlState> {
+        self.control.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_max_ejection_pct(&self, pct: u32) {
+        self.max_ejection_pct.store(pct.clamp(1, 100), Ordering::Release);
+        let mut st = self.write_control();
+        self.publish_locked(&mut st);
+    }
+
+    #[inline(always)]
+    pub fn is_panic_mode(&self) -> bool {
+        self.panic_mode.load(Ordering::Acquire)
     }
 
     fn build_snapshot(
         slots: &[SlotMeta],
         runtimes: &[SlotRuntime],
         generation: u64,
-    ) -> RoutingSnapshot {
+        max_ejection_pct: u32,
+    ) -> (RoutingSnapshot, bool) {
         let mut max_used = 0usize;
         for (i, s) in slots.iter().enumerate() {
             if s.occupied {
@@ -361,6 +392,7 @@ impl BackendPool {
         let mut macs = vec![[0u8; 6]; table_len];
         let mut weights = vec![1u32; table_len];
 
+        let mut eligible_cnt = 0usize;
         let mut healthy_ids = Vec::new();
         let mut weighted_items: Vec<(u16, u32)> = Vec::new();
         let mut key_storage: Vec<(u16, [u8; 6], u32)> = Vec::new();
@@ -374,20 +406,32 @@ impl BackendPool {
             macs[i] = s.spec.mac;
             weights[i] = s.spec.weight.max(1);
 
-            // Only route new flows to targets that are healthy, not draining, and weight > 0
-            if !s.draining && s.spec.weight > 0 && runtimes[i].healthy.load(Ordering::Relaxed) {
-                healthy_ids.push(i as u16);
-                weighted_items.push((i as u16, s.spec.weight));
-                let mut k = [0u8; 6];
-                k[0..4].copy_from_slice(&s.spec.endpoint.ip.to_be_bytes());
-                k[4..6].copy_from_slice(&s.spec.endpoint.port.to_be_bytes());
-                key_storage.push((i as u16, k, s.spec.weight));
+            if !s.draining && s.spec.weight > 0 {
+                eligible_cnt += 1;
+                if runtimes[i].healthy.load(Ordering::Relaxed) {
+                    healthy_ids.push(i as u16);
+                    weighted_items.push((i as u16, s.spec.weight));
+                    let mut k = [0u8; 6];
+                    k[0..4].copy_from_slice(&s.spec.endpoint.ip.to_be_bytes());
+                    k[4..6].copy_from_slice(&s.spec.endpoint.port.to_be_bytes());
+                    key_storage.push((i as u16, k, s.spec.weight));
+                }
             }
         }
 
-        // Fail-open safety: if active non-draining weighted targets exist but all failed health
-        // checks simultaneously, route across them rather than blackholing 100% of traffic!
-        if healthy_ids.is_empty() {
+        // Tier-0 Panic-Threshold / Max-Ejection Cap:
+        // If unhealthy backends exceed `max_ejection_pct` (e.g. >50% of eligible targets),
+        // enter Panic Mode and route across ALL eligible non-draining targets to prevent
+        // cascading overload collapse of the few surviving instances!
+        let ejected = eligible_cnt.saturating_sub(healthy_ids.len());
+        let trigger_panic = eligible_cnt > 0
+            && (healthy_ids.is_empty()
+                || (ejected * 100 > eligible_cnt * (max_ejection_pct as usize)));
+
+        if trigger_panic {
+            healthy_ids.clear();
+            weighted_items.clear();
+            key_storage.clear();
             for i in 0..max_used {
                 let s = &slots[i];
                 if s.occupied && !s.draining && s.spec.weight > 0 {
@@ -409,20 +453,22 @@ impl BackendPool {
         let smooth_wrr = build_smooth_wrr_schedule(&weighted_items);
         let alias = WeightedAlias::build(&weighted_items);
 
-        RoutingSnapshot {
-            generation,
-            healthy_ids,
-            endpoints,
-            macs,
-            weights,
-            maglev,
-            smooth_wrr,
-            alias,
-        }
+        (
+            RoutingSnapshot {
+                generation,
+                healthy_ids,
+                endpoints,
+                macs,
+                weights,
+                maglev,
+                smooth_wrr,
+                alias,
+            },
+            trigger_panic,
+        )
     }
 
     fn publish_locked(&self, st: &mut ControlState) -> u64 {
-        // Reclaim any draining slots whose active connection count has reached 0
         for (i, s) in st.slots.iter_mut().enumerate() {
             if s.occupied && s.draining && self.runtimes[i].active_conns.load(Ordering::Acquire) == 0
             {
@@ -431,14 +477,56 @@ impl BackendPool {
             }
         }
         let next_gen = self.generation.load(Ordering::Relaxed) + 1;
-        st.snapshot = Self::build_snapshot(&st.slots, &self.runtimes, next_gen);
+        let max_ej = self.max_ejection_pct.load(Ordering::Relaxed);
+        let (snap, panic) = Self::build_snapshot(&st.slots, &self.runtimes, next_gen, max_ej);
+        st.snapshot = snap;
+        self.panic_mode.store(panic, Ordering::Release);
         self.generation.store(next_gen, Ordering::Release);
         next_gen
     }
 
+    /// Reap any draining slots whose active connections have dropped to 0.
+    pub fn reap_drained_slots(&self) {
+        let mut st = self.write_control();
+        let has_reapable = st.slots.iter().enumerate().any(|(i, s)| {
+            s.occupied && s.draining && self.runtimes[i].active_conns.load(Ordering::Acquire) == 0
+        });
+        if has_reapable {
+            self.publish_locked(&mut st);
+        }
+    }
+
+    /// Hysteresis-aware active health probe outcome recorder (used by parallel `health.rs`).
+    pub fn record_probe_result(
+        &self,
+        slot_id: usize,
+        ok: bool,
+        rise_threshold: u32,
+        fall_threshold: u32,
+    ) {
+        let Some(rt) = self.runtimes.get(slot_id) else {
+            return;
+        };
+        if ok {
+            rt.consec_failures.store(0, Ordering::Relaxed);
+            let s = rt.consec_successes.fetch_add(1, Ordering::Relaxed) + 1;
+            if s >= rise_threshold.max(1) && !rt.healthy.swap(true, Ordering::AcqRel) {
+                let mut st = self.write_control();
+                self.publish_locked(&mut st);
+            }
+        } else {
+            rt.consec_successes.store(0, Ordering::Relaxed);
+            let f = rt.consec_failures.fetch_add(1, Ordering::Relaxed) + 1;
+            if f >= fall_threshold.max(1) && rt.healthy.swap(false, Ordering::AcqRel) {
+                let mut st = self.write_control();
+                self.publish_locked(&mut st);
+            }
+        }
+    }
+
     /// Dynamically register a new target (or update weight / un-drain if endpoint already exists).
     pub fn register_target(&self, spec: BackendSpec) -> MutationOutcome {
-        let mut st = self.control.write().unwrap();
+        let mut st = self.write_control();
 
         // If endpoint is already present, update weight & un-drain cleanly
         for (i, s) in st.slots.iter_mut().enumerate() {
@@ -487,7 +575,7 @@ impl BackendPool {
     ///   keeping its slot alive until `active_conns == 0`.
     /// - `graceful_drain = false`: removes the slot immediately.
     pub fn deregister_target(&self, ep: EndpointV4, graceful_drain: bool) -> MutationOutcome {
-        let mut st = self.control.write().unwrap();
+        let mut st = self.write_control();
         for (i, s) in st.slots.iter_mut().enumerate() {
             if s.occupied && s.spec.endpoint == ep {
                 let active = self.runtimes[i].active_conns.load(Ordering::Acquire);
@@ -515,7 +603,7 @@ impl BackendPool {
 
     /// Live-tune weight of an existing endpoint (`weight = 0` soft-drains it without removing).
     pub fn set_weight(&self, ep: EndpointV4, weight: u32) -> MutationOutcome {
-        let mut st = self.control.write().unwrap();
+        let mut st = self.write_control();
         for (i, s) in st.slots.iter_mut().enumerate() {
             if s.occupied && s.spec.endpoint == ep {
                 s.spec.weight = weight.min(1000);
@@ -534,7 +622,7 @@ impl BackendPool {
 
     /// Live-tune weight for all targets belonging to a DNS source key (e.g. `"api.internal:8080"`).
     pub fn set_dns_weight(&self, dns_source: &str, weight: u32) -> (usize, u64) {
-        let mut st = self.control.write().unwrap();
+        let mut st = self.write_control();
         let mut updated = 0usize;
         for s in st.slots.iter_mut() {
             if s.occupied && s.spec.dns_source.as_deref() == Some(dns_source) {
@@ -555,7 +643,7 @@ impl BackendPool {
 
     /// Deregister all endpoints belonging to a DNS source key.
     pub fn deregister_dns_source(&self, dns_source: &str, graceful_drain: bool) -> (usize, u64) {
-        let mut st = self.control.write().unwrap();
+        let mut st = self.write_control();
         let mut affected = 0usize;
         for (i, s) in st.slots.iter_mut().enumerate() {
             if s.occupied && s.spec.dns_source.as_deref() == Some(dns_source) {
@@ -587,7 +675,7 @@ impl BackendPool {
         resolved: &[EndpointV4],
         weight: u32,
     ) -> (usize, usize, u64) {
-        let mut st = self.control.write().unwrap();
+        let mut st = self.write_control();
         let mut added = 0usize;
         let mut drained = 0usize;
         let mut changed = false;
@@ -649,7 +737,7 @@ impl BackendPool {
 
     /// Return complete target list with live weights, traffic shares, health, and connection stats.
     pub fn list_targets(&self) -> Vec<TargetStatus> {
-        let st = self.control.read().unwrap();
+        let st = self.read_control();
         let mut total_active_weight: u64 = 0;
         for (i, s) in st.slots.iter().enumerate() {
             if s.occupied
@@ -695,7 +783,7 @@ impl BackendPool {
     }
 
     pub fn snapshot(&self) -> RoutingSnapshot {
-        self.control.read().unwrap().snapshot.clone()
+        self.read_control().snapshot.clone()
     }
 
     #[inline(always)]
@@ -733,7 +821,7 @@ impl BackendPool {
         if let Some(rt) = self.runtimes.get(idx) {
             let fails = rt.consec_failures.fetch_add(1, Ordering::Relaxed) + 1;
             if fails >= self.failure_threshold && rt.healthy.swap(false, Ordering::AcqRel) {
-                let mut st = self.control.write().unwrap();
+                let mut st = self.write_control();
                 self.publish_locked(&mut st);
             }
         }
@@ -745,53 +833,21 @@ impl BackendPool {
                 rt.consec_failures.store(0, Ordering::Relaxed);
             }
             if rt.healthy.swap(healthy, Ordering::AcqRel) != healthy {
-                let mut st = self.control.write().unwrap();
+                let mut st = self.write_control();
                 self.publish_locked(&mut st);
             }
         }
     }
 
-    /// Spawn active background TCP health-check loop (also reaps finished draining slots!).
+    /// Spawn active background parallel non-blocking health-check loop (TCP/HTTP + hysteresis + panic-mode).
     pub fn spawn_health_checker(
         self: &Arc<Self>,
         interval: Duration,
         stop: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
-        let pool = Arc::clone(self);
-        std::thread::Builder::new()
-            .name("tetrux-health".to_string())
-            .spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let targets = pool.list_targets();
-                    let mut need_reap = false;
-                    for t in &targets {
-                        if t.draining {
-                            if t.active_conns == 0 {
-                                need_reap = true;
-                            }
-                            continue;
-                        }
-                        let addr = std::net::SocketAddr::V4(t.endpoint.to_std());
-                        let ok = std::net::TcpStream::connect_timeout(
-                            &addr,
-                            Duration::from_millis(250),
-                        )
-                        .is_ok();
-                        pool.set_healthy(t.slot_id as usize, ok);
-                    }
-                    if need_reap {
-                        let mut st = pool.control.write().unwrap();
-                        pool.publish_locked(&mut st);
-                    }
-                    let mut slept = Duration::ZERO;
-                    let step = Duration::from_millis(50);
-                    while slept < interval && !stop.load(Ordering::Relaxed) {
-                        std::thread::sleep(step);
-                        slept += step;
-                    }
-                }
-            })
-            .expect("failed to spawn health checker")
+        let mut cfg = super::health::HealthCheckConfig::default();
+        cfg.interval = interval;
+        super::health::spawn_parallel_health_checker(Arc::clone(self), cfg, stop)
     }
 }
 

@@ -181,7 +181,7 @@ impl DnsManager {
         let w = weight.min(1000);
         let resolved = (self.resolver)(host, port)?;
         let (added, drained, generation) = self.pool.reconcile_dns_endpoints(&key, &resolved, w);
-        let mut map = self.entries.write().unwrap();
+        let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         map.insert(
             key.clone(),
             DnsEntry {
@@ -206,7 +206,7 @@ impl DnsManager {
     pub fn set_dns_weight(&self, key: &str, weight: u32) -> Option<(usize, u64)> {
         let w = weight.min(1000);
         {
-            let mut map = self.entries.write().unwrap();
+            let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
             let entry = map.get_mut(key)?;
             entry.weight = w;
         }
@@ -216,7 +216,7 @@ impl DnsManager {
     /// Unsubscribe a DNS pool and gracefully drain/remove all endpoints it owns.
     pub fn deregister_dns(&self, key: &str, graceful_drain: bool) -> Option<(usize, u64)> {
         let removed = {
-            let mut map = self.entries.write().unwrap();
+            let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
             map.remove(key).is_some()
         };
         if !removed {
@@ -229,7 +229,7 @@ impl DnsManager {
     /// Transient DNS failures preserve last-known-good targets without dropping traffic.
     pub fn refresh_all(&self) -> usize {
         let snapshot: Vec<(String, String, u16, u32)> = {
-            let map = self.entries.read().unwrap();
+            let map = self.entries.read().unwrap_or_else(|e| e.into_inner());
             map.iter()
                 .map(|(k, e)| (k.clone(), e.host.clone(), e.port, e.weight))
                 .collect()
@@ -242,7 +242,7 @@ impl DnsManager {
                     let (added, drained, _) =
                         self.pool.reconcile_dns_endpoints(&key, &resolved, weight);
                     total_changes += added + drained;
-                    let mut map = self.entries.write().unwrap();
+                    let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(e) = map.get_mut(&key) {
                         e.last_resolved = resolved;
                         e.last_error = None;
@@ -251,7 +251,7 @@ impl DnsManager {
                 }
                 Err(err) => {
                     // Fail-safe: record error but DO NOT evict last-known-good backends!
-                    let mut map = self.entries.write().unwrap();
+                    let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(e) = map.get_mut(&key) {
                         e.last_error = Some(err.to_string());
                         e.last_sync_ms = now_unix_ms();
@@ -263,7 +263,7 @@ impl DnsManager {
     }
 
     pub fn list_subscriptions(&self) -> Vec<DnsSubscriptionStatus> {
-        let map = self.entries.read().unwrap();
+        let map = self.entries.read().unwrap_or_else(|e| e.into_inner());
         map.iter()
             .map(|(k, e)| DnsSubscriptionStatus {
                 key: k.clone(),
