@@ -1,9 +1,8 @@
-//! Bare-metal Linux kernel-bypass ABI definitions & setup wrappers:
-//! - `AF_XDP` (`XDP_ZEROCOPY`, `XDP_UMEM_REG`, RX/TX/Fill/Completion mmap rings)
+//! Bare-metal Linux kernel-bypass ABI definitions, mmap ring driver, & syscall setup:
+//! - `AF_XDP` (`XDP_ZEROCOPY`, `XDP_UMEM_REG`, RX/TX/Fill/Completion mmap rings, `XDP_RING_NEED_WAKEUP`)
 //! - `io_uring` (`IORING_SETUP_SQPOLL`, `IORING_SETUP_SINGLE_ISSUER` zero-syscall submission)
 //!
-//! ABI structs compile on all targets for layout verification; actual syscalls activate
-//! under `#[cfg(target_os = "linux")]`.
+//! Companion XDP eBPF redirect & DDoS drop program lives in `ebpf/tetrux_xdp.c`.
 
 /// Exact Linux `struct xdp_umem_reg` (uapi/linux/if_xdp.h).
 #[repr(C)]
@@ -47,6 +46,12 @@ pub struct XdpMmapOffsets {
     pub fr: XdpRingOffset,
     pub cr: XdpRingOffset,
 }
+
+pub const XDP_PGOFF_RX_RING: i64 = 0;
+pub const XDP_PGOFF_TX_RING: i64 = 0x8000_0000;
+pub const XDP_UMEM_PGOFF_FILL_RING: i64 = 0x1_0000_0000;
+pub const XDP_UMEM_PGOFF_COMPLETION_RING: i64 = 0x1_8000_0000;
+pub const XDP_RING_NEED_WAKEUP: u32 = 1 << 0;
 
 /// Exact Linux `struct io_uring_sqe` (64 bytes, uapi/linux/io_uring.h).
 #[repr(C)]
@@ -96,27 +101,146 @@ pub struct IoUringParams {
 #[cfg(target_os = "linux")]
 pub mod linux_syscalls {
     use super::*;
-    use crate::engine::bypass::{UmemArena, FRAME_HEADROOM, FRAME_SIZE};
+    use crate::engine::bypass::{PacketDesc, UmemArena, FRAME_HEADROOM, FRAME_SIZE};
     use crate::sys::linux::{
         AF_XDP, IORING_SETUP_COOP_TASKRUN, IORING_SETUP_SINGLE_ISSUER, IORING_SETUP_SQPOLL,
-        SOCK_RAW, SOL_XDP, XDP_RX_RING, XDP_TX_RING, XDP_UMEM_COMPLETION_RING,
-        XDP_UMEM_FILL_RING, XDP_UMEM_REG, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
+        MSG_DONTWAIT, SOCK_RAW, SOL_XDP, XDP_MMAP_OFFSETS, XDP_RX_RING, XDP_TX_RING,
+        XDP_UMEM_COMPLETION_RING, XDP_UMEM_FILL_RING, XDP_UMEM_REG, XDP_USE_NEED_WAKEUP,
+        XDP_ZEROCOPY,
     };
     use std::ffi::c_void;
     use std::io;
     use std::mem::{size_of, zeroed};
+    use std::ptr;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     const SYS_IO_URING_SETUP: i64 = 425;
     const SYS_IO_URING_ENTER: i64 = 426;
+    const PROT_READ: i32 = 0x1;
+    const PROT_WRITE: i32 = 0x2;
+    const MAP_SHARED: i32 = 0x01;
+    const MAP_POPULATE: i32 = 0x8000;
 
     extern "C" {
         fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
         fn bind(fd: i32, addr: *const c_void, len: u32) -> i32;
         fn setsockopt(fd: i32, level: i32, opt: i32, val: *const c_void, len: u32) -> i32;
+        fn getsockopt(fd: i32, level: i32, opt: i32, val: *mut c_void, len: *mut u32) -> i32;
+        fn sendto(fd: i32, buf: *const c_void, len: usize, flags: i32, addr: *const c_void, alen: u32) -> isize;
+        fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+        fn close(fd: i32) -> i32;
         fn syscall(num: i64, ...) -> i64;
     }
 
-    /// Create and bind an `AF_XDP` zero-copy NIC queue socket over `UmemArena`.
+    /// Mapped Linux `AF_XDP` zero-copy NIC queue (RX + TX + Fill + Completion rings).
+    pub struct AfXdpQueue {
+        pub fd: i32,
+        pub ring_mask: u32,
+        rx_map: *mut u8,
+        rx_map_len: usize,
+        tx_map: *mut u8,
+        tx_map_len: usize,
+        fr_map: *mut u8,
+        fr_map_len: usize,
+        cr_map: *mut u8,
+        cr_map_len: usize,
+        pub offsets: XdpMmapOffsets,
+    }
+
+    impl AfXdpQueue {
+        /// Open, register UMEM, configure 4 rings, `mmap()` all ring descriptors, and bind
+        /// zero-copy to `(ifindex, queue_id)`.
+        pub fn open(
+            ifindex: u32,
+            queue_id: u32,
+            ring_entries: u32,
+            umem: &UmemArena,
+        ) -> io::Result<Self> {
+            let ring_entries = ring_entries.max(64).next_power_of_two();
+            let fd = open_af_xdp_socket(ifindex, queue_id, ring_entries, umem)?;
+            let mut offsets = XdpMmapOffsets::default();
+            let mut optlen = size_of::<XdpMmapOffsets>() as u32;
+            if unsafe {
+                getsockopt(
+                    fd,
+                    SOL_XDP,
+                    XDP_MMAP_OFFSETS,
+                    &mut offsets as *mut _ as *mut c_void,
+                    &mut optlen,
+                )
+            } < 0
+            {
+                unsafe { close(fd) };
+                return Err(io::Error::last_os_error());
+            }
+
+            let map_ring = |off_desc: u64, elem_sz: usize, pgoff: i64| -> io::Result<(*mut u8, usize)> {
+                let len = off_desc as usize + (ring_entries as usize) * elem_sz;
+                let p = unsafe {
+                    mmap(
+                        ptr::null_mut(),
+                        len,
+                        PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_POPULATE,
+                        fd,
+                        pgoff,
+                    )
+                };
+                if p as isize == -1 || p.is_null() {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok((p as *mut u8, len))
+                }
+            };
+
+            let (rx_map, rx_map_len) = map_ring(offsets.rx.desc, size_of::<PacketDesc>(), XDP_PGOFF_RX_RING)?;
+            let (tx_map, tx_map_len) = map_ring(offsets.tx.desc, size_of::<PacketDesc>(), XDP_PGOFF_TX_RING)?;
+            let (fr_map, fr_map_len) = map_ring(offsets.fr.desc, size_of::<u64>(), XDP_UMEM_PGOFF_FILL_RING)?;
+            let (cr_map, cr_map_len) = map_ring(offsets.cr.desc, size_of::<u64>(), XDP_UMEM_PGOFF_COMPLETION_RING)?;
+
+            Ok(Self {
+                fd,
+                ring_mask: ring_entries - 1,
+                rx_map,
+                rx_map_len,
+                tx_map,
+                tx_map_len,
+                fr_map,
+                fr_map_len,
+                cr_map,
+                cr_map_len,
+                offsets,
+            })
+        }
+
+        /// Kick NIC TX/RX driver ONLY when kernel sets `XDP_RING_NEED_WAKEUP` (0 syscalls under load!).
+        #[inline]
+        pub fn kick_tx_if_needed(&self) {
+            let flags = unsafe {
+                let ptr = self.tx_map.add(self.offsets.tx.flags as usize) as *const AtomicU32;
+                (*ptr).load(Ordering::Acquire)
+            };
+            if (flags & XDP_RING_NEED_WAKEUP) != 0 {
+                unsafe {
+                    sendto(self.fd, ptr::null(), 0, MSG_DONTWAIT, ptr::null(), 0);
+                }
+            }
+        }
+    }
+
+    impl Drop for AfXdpQueue {
+        fn drop(&mut self) {
+            unsafe {
+                munmap(self.rx_map as *mut c_void, self.rx_map_len);
+                munmap(self.tx_map as *mut c_void, self.tx_map_len);
+                munmap(self.fr_map as *mut c_void, self.fr_map_len);
+                munmap(self.cr_map as *mut c_void, self.cr_map_len);
+                close(self.fd);
+            }
+        }
+    }
+
     pub fn open_af_xdp_socket(
         ifindex: u32,
         queue_id: u32,
@@ -177,8 +301,6 @@ pub mod linux_syscalls {
         Ok(fd)
     }
 
-    /// Initialize an `io_uring` instance with `IORING_SETUP_SQPOLL` (kernel-side submission
-    /// poller thread enabling zero-syscall async I/O submissions!).
     pub fn setup_io_uring_sqpoll(entries: u32, sq_idle_ms: u32) -> io::Result<(i32, IoUringParams)> {
         let mut params: IoUringParams = unsafe { zeroed() };
         params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
