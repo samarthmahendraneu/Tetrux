@@ -419,6 +419,7 @@ fn run_bypass_single(
     let mut cfg = BypassConfig::default();
     cfg.mode = mode;
     cfg.conntrack_capacity = 65_536;
+    cfg.gateway_ip = 0xc633_6401; // VIP 198.51.100.1
 
     // Lock-free atomic spin-gate handshake (zero std::sync::Barrier heap allocations!)
     let stop = Arc::new(AtomicBool::new(false));
@@ -586,7 +587,24 @@ fn run_bypass_single(
                                         let ts = unsafe { umem_nic.read_headroom_ts(d.addr) };
                                         hist.record_ns(sys::fast_now_ns().saturating_sub(ts));
                                     }
-                                    free_frames.push(d.addr);
+                                    // Reset frame offset & EtherType/VIP for loopback UMEM reuse
+                                    // (on a real NIC, incoming DMA populates fresh L2/L3 headers).
+                                    let fbase = UmemArena::frame_base_of(d.addr);
+                                    let orig_addr = fbase + tetrux::engine::bypass::FRAME_HEADROOM as u64;
+                                    if mode == BypassForwardMode::DsrIpip {
+                                        unsafe {
+                                            let p = umem_nic.data_ptr(orig_addr);
+                                            *p.add(12) = 0x08;
+                                            *p.add(13) = 0x00;
+                                        }
+                                    } else if mode == BypassForwardMode::FullBidirectionalNat {
+                                        unsafe {
+                                            let p = umem_nic.data_ptr(orig_addr);
+                                            let vip = 0xc633_6401u32.to_be_bytes();
+                                            std::ptr::copy_nonoverlapping(vip.as_ptr(), p.add(30), 4);
+                                        }
+                                    }
+                                    free_frames.push(orig_addr);
                                 }
                                 recvd += got as u64;
                             } else {
@@ -663,12 +681,14 @@ fn suite_1_kernel_bypass() {
     println!("==================================================================================================================================");
     run_bypass_single("1a. 1-Core NAT (64B wire)", BypassForwardMode::Nat, 1, 10, 4_000_000, 4096, 4096, None);
     run_bypass_single("1b. 1-Core NAT (1024B wire)", BypassForwardMode::Nat, 1, 970, 4_000_000, 4096, 4096, None);
-    run_bypass_single("1c. 1-Core DSR (64B wire)", BypassForwardMode::Dsr, 1, 10, 4_000_000, 4096, 4096, None);
-    run_bypass_single("1d. 1-Core Low-Queue NAT (64 inflt)", BypassForwardMode::Nat, 1, 10, 1_000_000, 1024, 64, None);
-    run_bypass_single("1e. 2-Core NAT Scaling (64B)", BypassForwardMode::Nat, 2, 10, 4_000_000, 8192, 4096, None);
-    run_bypass_single("1f. 4-Core NAT Scaling (64B)", BypassForwardMode::Nat, 4, 10, 4_000_000, 16384, 4096, None);
-    run_bypass_single("1g. 4-Core DSR Scaling (1024B)", BypassForwardMode::Dsr, 4, 970, 4_000_000, 16384, 4096, None);
-    run_bypass_single("1h. Micro-Burst (5x40k, 16k flows)", BypassForwardMode::Nat, 1, 10, 0, 16384, 4096, Some((5, 40_000)));
+    run_bypass_single("1c. 1-Core DSR L2 (64B wire)", BypassForwardMode::Dsr, 1, 10, 4_000_000, 4096, 4096, None);
+    run_bypass_single("1d. 1-Core DSR IPIP Encap (64B)", BypassForwardMode::DsrIpip, 1, 10, 4_000_000, 4096, 4096, None);
+    run_bypass_single("1e. 1-Core Full Bidir-NAT (64B)", BypassForwardMode::FullBidirectionalNat, 1, 10, 4_000_000, 4096, 4096, None);
+    run_bypass_single("1f. 1-Core Low-Queue NAT (64 inflt)", BypassForwardMode::Nat, 1, 10, 1_000_000, 1024, 64, None);
+    run_bypass_single("1g. 2-Core NAT Scaling (64B)", BypassForwardMode::Nat, 2, 10, 4_000_000, 8192, 4096, None);
+    run_bypass_single("1h. 4-Core DSR IPIP (1024B wire)", BypassForwardMode::DsrIpip, 4, 970, 4_000_000, 16384, 4096, None);
+    run_bypass_single("1i. 4-Core DSR L2 (1024B wire)", BypassForwardMode::Dsr, 4, 970, 4_000_000, 16384, 4096, None);
+    run_bypass_single("1j. Micro-Burst (5x40k, 16k flows)", BypassForwardMode::Nat, 1, 10, 0, 16384, 4096, Some((5, 40_000)));
 }
 
 // ============================================================================
@@ -1475,10 +1495,47 @@ fn suite_8_control_plane_and_weights(backends: &[EndpointV4]) {
         c1_post.saturating_sub(c1_drain_base)
     );
     println!("  GET /stats      : {}", http_call(admin_ep, "GET", "/stats", ""));
+    let metrics_out = http_call(admin_ep, "GET", "/metrics", "");
+    println!(
+        "  GET /metrics    : {} bytes (Prometheus OpenMetrics, contains tetrux_tcp_accepted_connections_total={})",
+        metrics_out.len(),
+        metrics_out.contains("tetrux_tcp_accepted_connections_total")
+    );
+
+    // 4. Verify live PROXY Protocol v2 header delivery through TCP NLB!
+    let proxy_be = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_be_ep = match proxy_be.local_addr().unwrap() {
+        std::net::SocketAddr::V4(v4) => EndpointV4::from_std(v4),
+        _ => unreachable!(),
+    };
+    let pv2_pool = BackendPool::new(vec![BackendSpec::new(proxy_be_ep)], LbAlgorithm::RoundRobin);
+    let mut pv2_cfg = TcpEngineConfig::default();
+    pv2_cfg.workers = 1;
+    pv2_cfg.proxy_protocol_v2 = true;
+    let pv2_nlb = start_tcp_nlb(pv2_cfg, pv2_pool).unwrap();
+    let pv2_ep = pv2_nlb.bound_addr();
+    let pv2_server = std::thread::spawn(move || {
+        let (mut s, _) = proxy_be.accept().unwrap();
+        let mut buf = [0u8; 32];
+        s.read_exact(&mut buf).unwrap();
+        buf
+    });
+    let mut pv2_cli = TcpStream::connect(pv2_ep.to_std()).unwrap();
+    let cli_local = match pv2_cli.local_addr().unwrap() {
+        std::net::SocketAddr::V4(v4) => EndpointV4::from_std(v4),
+        _ => unreachable!(),
+    };
+    pv2_cli.write_all(b"DATA").unwrap();
+    let received = pv2_server.join().unwrap();
+    let decoded = tetrux::proto::proxy_v2::decode_v2(&received[..28]).expect("valid PROXY v2 header");
+    assert_eq!(&received[28..32], b"DATA");
+    println!("  PROXY v2 Live   : decoded={decoded:?} matches_client={cli_local} payload=DATA (OK!)");
+    drop(pv2_cli);
+    pv2_nlb.drain_and_stop(Duration::from_secs(1));
 
     admin.stop();
     if let Ok(h) = Arc::try_unwrap(nlb) {
-        h.stop();
+        h.drain_and_stop(Duration::from_secs(1));
     }
 }
 
