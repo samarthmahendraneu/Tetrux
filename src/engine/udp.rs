@@ -1,14 +1,15 @@
-//! Syscall-Batched L4 UDP Network Load Balancer.
+//! Multi-Worker Syscall-Batched L4 UDP Network Load Balancer.
 //!
-//! Minimizes user/kernel mode switches by up to 64x using:
-//! - macOS Darwin native `recvmsg_x` / `sendmsg_x` (Linux `recvmmsg` / `sendmmsg`)
+//! Tier-0 hardened:
+//! - macOS Darwin `recvmsg_x` / `sendmsg_x` AND Linux `recvmmsg` / `sendmmsg` (up to 64 pkts/syscall!)
+//! - Multi-worker `SO_REUSEPORT` scaling (Linux)
+//! - Periodic Idle UDP Session Reaper (prevents FD exhaustion under UDP source-port floods!)
+//! - Per-Source-IP Token-Bucket Flood Limiter (O(1), 0 allocations)
 //! - L2-cache-resident flat pre-allocated packet arena (0 heap allocations per packet!)
-//! - Fixed-capacity open-addressed client->backend NAT session table
-//! - Adaptive hybrid busy-polling for ultra-low tail latency
-//! Also supports `batched = false` (`recvfrom`/`sendto`) for apples-to-apples benchmarking.
 
 use crate::lb::balancer::{BackendPool, WorkerSelector};
 use crate::lb::hash::hash_endpoint;
+use crate::lb::ratelimit::{PerIpLimiter, RateLimitConfig};
 use crate::mem::cache::CachePadded;
 use crate::sys::{self, EndpointV4, Fd, IoVec, MsgHdrX, Poller, SockAddrIn, WakeHandle};
 use std::ffi::c_void;
@@ -27,6 +28,8 @@ const MAX_PROBE: usize = 16;
 #[derive(Clone, Debug)]
 pub struct UdpEngineConfig {
     pub listen_addr: EndpointV4,
+    /// Number of UDP workers (uses `SO_REUSEPORT` when > 1 on Linux).
+    pub workers: usize,
     /// Enable syscall batching (`recvmsg_x`/`sendmsg_x` on macOS, `recvmmsg`/`sendmmsg` on Linux).
     pub batched: bool,
     pub batch_size: usize,
@@ -34,18 +37,21 @@ pub struct UdpEngineConfig {
     pub max_sessions: usize,
     pub busy_poll_us: u64,
     pub session_timeout_secs: u64,
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for UdpEngineConfig {
     fn default() -> Self {
         Self {
             listen_addr: EndpointV4::from_octets(127, 0, 0, 1, 0),
+            workers: 1,
             batched: true,
             batch_size: MAX_BATCH,
             sock_buf_bytes: 2 * 1024 * 1024,
             max_sessions: 4096,
             busy_poll_us: 150,
             session_timeout_secs: 30,
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -60,6 +66,8 @@ pub struct UdpCounters {
     pub send_syscalls: AtomicU64,
     pub poll_calls: AtomicU64,
     pub sessions_created: AtomicU64,
+    pub sessions_reaped: AtomicU64,
+    pub rate_limited: AtomicU64,
     pub drops: AtomicU64,
     pub worker_cpu_ns: AtomicU64,
 }
@@ -74,6 +82,8 @@ pub struct UdpStatsSnapshot {
     pub send_syscalls: u64,
     pub poll_calls: u64,
     pub sessions_created: u64,
+    pub sessions_reaped: u64,
+    pub rate_limited: u64,
     pub drops: u64,
     pub worker_cpu_ns: u64,
 }
@@ -113,9 +123,9 @@ impl Default for UdpSession {
 pub struct UdpNlbHandle {
     bound_addr: EndpointV4,
     stop: Arc<AtomicBool>,
-    counters: Arc<CachePadded<UdpCounters>>,
-    wake: WakeHandle,
-    thread: Option<JoinHandle<()>>,
+    counters: Arc<Vec<CachePadded<UdpCounters>>>,
+    wakers: Vec<WakeHandle>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl UdpNlbHandle {
@@ -124,25 +134,30 @@ impl UdpNlbHandle {
     }
 
     pub fn stats(&self) -> UdpStatsSnapshot {
-        let c = &self.counters;
-        UdpStatsSnapshot {
-            rx_packets: c.rx_packets.load(Ordering::Relaxed),
-            tx_packets: c.tx_packets.load(Ordering::Relaxed),
-            rx_bytes: c.rx_bytes.load(Ordering::Relaxed),
-            tx_bytes: c.tx_bytes.load(Ordering::Relaxed),
-            recv_syscalls: c.recv_syscalls.load(Ordering::Relaxed),
-            send_syscalls: c.send_syscalls.load(Ordering::Relaxed),
-            poll_calls: c.poll_calls.load(Ordering::Relaxed),
-            sessions_created: c.sessions_created.load(Ordering::Relaxed),
-            drops: c.drops.load(Ordering::Relaxed),
-            worker_cpu_ns: c.worker_cpu_ns.load(Ordering::Relaxed),
+        let mut s = UdpStatsSnapshot::default();
+        for c in self.counters.iter() {
+            s.rx_packets += c.rx_packets.load(Ordering::Relaxed);
+            s.tx_packets += c.tx_packets.load(Ordering::Relaxed);
+            s.rx_bytes += c.rx_bytes.load(Ordering::Relaxed);
+            s.tx_bytes += c.tx_bytes.load(Ordering::Relaxed);
+            s.recv_syscalls += c.recv_syscalls.load(Ordering::Relaxed);
+            s.send_syscalls += c.send_syscalls.load(Ordering::Relaxed);
+            s.poll_calls += c.poll_calls.load(Ordering::Relaxed);
+            s.sessions_created += c.sessions_created.load(Ordering::Relaxed);
+            s.sessions_reaped += c.sessions_reaped.load(Ordering::Relaxed);
+            s.rate_limited += c.rate_limited.load(Ordering::Relaxed);
+            s.drops += c.drops.load(Ordering::Relaxed);
+            s.worker_cpu_ns += c.worker_cpu_ns.load(Ordering::Relaxed);
         }
+        s
     }
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Release);
-        self.wake.wake();
-        if let Some(t) = self.thread.take() {
+        for w in &self.wakers {
+            w.wake();
+        }
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }
@@ -151,8 +166,10 @@ impl UdpNlbHandle {
 impl Drop for UdpNlbHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.wake.wake();
-        if let Some(t) = self.thread.take() {
+        for w in &self.wakers {
+            w.wake();
+        }
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }
@@ -162,45 +179,70 @@ pub fn start_udp_nlb(
     config: UdpEngineConfig,
     pool: Arc<BackendPool>,
 ) -> io::Result<UdpNlbHandle> {
-    let (front_fd, bound) =
-        sys::create_udp_socket(config.listen_addr, false, config.sock_buf_bytes)?;
-    let poller = Poller::new(512)?;
-    let wake = poller.wake_handle();
+    #[cfg(target_os = "linux")]
+    let num_workers = config.workers.max(1);
+    #[cfg(not(target_os = "linux"))]
+    let num_workers = 1usize; // macOS XNU does not hash unicast UDP across SO_REUSEPORT sockets
+
+    let reuse_port = num_workers > 1;
+    let (first_fd, bound) =
+        sys::create_udp_socket(config.listen_addr, reuse_port, config.sock_buf_bytes)?;
+    let mut front_fds = Vec::with_capacity(num_workers);
+    front_fds.push(first_fd);
+    for _ in 1..num_workers {
+        let (fd, _) = sys::create_udp_socket(bound, true, config.sock_buf_bytes)?;
+        front_fds.push(fd);
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
-    let counters = Arc::new(CachePadded::new(UdpCounters::default()));
+    let counters: Arc<Vec<CachePadded<UdpCounters>>> = Arc::new(
+        (0..num_workers)
+            .map(|_| CachePadded::new(UdpCounters::default()))
+            .collect(),
+    );
+    let mut wakers = Vec::with_capacity(num_workers);
+    let mut threads = Vec::with_capacity(num_workers);
 
-    let stop_c = Arc::clone(&stop);
-    let cnt_c = Arc::clone(&counters);
+    for (wid, front_fd) in front_fds.into_iter().enumerate() {
+        let poller = Poller::new(512)?;
+        wakers.push(poller.wake_handle());
+        let cfg = config.clone();
+        let pool_c = Arc::clone(&pool);
+        let stop_c = Arc::clone(&stop);
+        let cnt_c = Arc::clone(&counters);
 
-    let thread = std::thread::Builder::new()
-        .name("tetrux-udp-w0".to_string())
-        .spawn(move || {
-            sys::pin_thread_performance(0);
-            let mut worker = UdpWorker::new(front_fd, config, poller, pool, cnt_c);
-            worker.run(stop_c);
-        })?;
+        threads.push(
+            std::thread::Builder::new()
+                .name(format!("tetrux-udp-w{wid}"))
+                .spawn(move || {
+                    sys::pin_thread_performance(wid);
+                    let mut worker = UdpWorker::new(wid, front_fd, cfg, poller, pool_c, cnt_c);
+                    worker.run(stop_c);
+                })?,
+        );
+    }
 
     Ok(UdpNlbHandle {
         bound_addr: bound,
         stop,
         counters,
-        wake,
-        thread: Some(thread),
+        wakers,
+        threads,
     })
 }
 
 struct UdpWorker {
+    wid: usize,
     front_fd: Fd,
     cfg: UdpEngineConfig,
     poller: Poller,
     selector: WorkerSelector,
+    limiter: PerIpLimiter,
     sessions: Vec<UdpSession>,
     session_mask: usize,
-    counters: Arc<CachePadded<UdpCounters>>,
-    /// Flat L2-resident packet buffer arena: `batch_size * 2048` bytes.
+    counters: Arc<Vec<CachePadded<UdpCounters>>>,
     pkt_arena: Vec<u8>,
     batch_size: usize,
-    // Local hot stats
     rx_pkts: u64,
     tx_pkts: u64,
     rx_bytes: u64,
@@ -209,25 +251,31 @@ struct UdpWorker {
     send_sc: u64,
     poll_sc: u64,
     sessions_created: u64,
+    sessions_reaped: u64,
+    rate_limited: u64,
     drops: u64,
 }
 
 impl UdpWorker {
     fn new(
+        wid: usize,
         front_fd: Fd,
         cfg: UdpEngineConfig,
         mut poller: Poller,
         pool: Arc<BackendPool>,
-        counters: Arc<CachePadded<UdpCounters>>,
+        counters: Arc<Vec<CachePadded<UdpCounters>>>,
     ) -> Self {
         poller.add_read(front_fd, FRONTEND_TOKEN, false);
         let cap = cfg.max_sessions.max(64).next_power_of_two();
         let batch_size = cfg.batch_size.clamp(1, MAX_BATCH);
+        let limiter = PerIpLimiter::new(cfg.rate_limit);
         Self {
+            wid,
             front_fd,
             cfg,
             poller,
-            selector: WorkerSelector::new(pool, 0),
+            selector: WorkerSelector::new(pool, wid),
+            limiter,
             sessions: vec![UdpSession::default(); cap],
             session_mask: cap - 1,
             counters,
@@ -241,12 +289,14 @@ impl UdpWorker {
             send_sc: 0,
             poll_sc: 0,
             sessions_created: 0,
+            sessions_reaped: 0,
+            rate_limited: 0,
             drops: 0,
         }
     }
 
     fn flush_stats(&mut self) {
-        let c = &self.counters;
+        let c = &self.counters[self.wid];
         c.rx_packets.fetch_add(self.rx_pkts, Ordering::Relaxed);
         c.tx_packets.fetch_add(self.tx_pkts, Ordering::Relaxed);
         c.rx_bytes.fetch_add(self.rx_bytes, Ordering::Relaxed);
@@ -256,6 +306,10 @@ impl UdpWorker {
         c.poll_calls.fetch_add(self.poll_sc, Ordering::Relaxed);
         c.sessions_created
             .fetch_add(self.sessions_created, Ordering::Relaxed);
+        c.sessions_reaped
+            .fetch_add(self.sessions_reaped, Ordering::Relaxed);
+        c.rate_limited
+            .fetch_add(self.rate_limited, Ordering::Relaxed);
         c.drops.fetch_add(self.drops, Ordering::Relaxed);
         c.worker_cpu_ns
             .store(sys::thread_cpu_time_ns(), Ordering::Relaxed);
@@ -267,10 +321,28 @@ impl UdpWorker {
         self.send_sc = 0;
         self.poll_sc = 0;
         self.sessions_created = 0;
+        self.sessions_reaped = 0;
+        self.rate_limited = 0;
         self.drops = 0;
     }
 
-    /// Lookup or allocate an open-addressed NAT session for `client_ep`.
+    /// Reap idle UDP NAT sessions and close their backend sockets (prevents FD exhaustion!).
+    fn reap_idle_sessions(&mut self, now_ns: u64, timeout_ns: u64) {
+        if timeout_ns == 0 {
+            return;
+        }
+        for s in &mut self.sessions {
+            if s.occupied && now_ns.wrapping_sub(s.last_seen_ns) >= timeout_ns {
+                self.poller.del_read(s.backend_fd);
+                sys::close_fd(s.backend_fd);
+                self.limiter.release_conn(s.client_ep.ip);
+                s.occupied = false;
+                s.backend_fd = -1;
+                self.sessions_reaped += 1;
+            }
+        }
+    }
+
     #[inline]
     fn get_or_create_session(&mut self, client_ep: EndpointV4, now_ns: u64) -> Option<usize> {
         let h = hash_endpoint(client_ep);
@@ -297,12 +369,26 @@ impl UdpWorker {
             }
         }
 
+        // Apply per-IP flood limiter ONLY on new session creation!
+        if !self.limiter.admit(client_ep.ip, now_ns) {
+            self.rate_limited += 1;
+            return None;
+        }
+
         let target = free_slot.unwrap_or(oldest_slot);
         if self.sessions[target].occupied {
+            self.poller.del_read(self.sessions[target].backend_fd);
             sys::close_fd(self.sessions[target].backend_fd);
+            self.limiter.release_conn(self.sessions[target].client_ep.ip);
         }
-        let (backend_idx, backend_ep) = self.selector.select(h)?;
-        let backend_fd = sys::connect_udp_socket(backend_ep, self.cfg.sock_buf_bytes).ok()?;
+        let Some((backend_idx, backend_ep)) = self.selector.select(h) else {
+            self.limiter.release_conn(client_ep.ip);
+            return None;
+        };
+        let Ok(backend_fd) = sys::connect_udp_socket(backend_ep, self.cfg.sock_buf_bytes) else {
+            self.limiter.release_conn(client_ep.ip);
+            return None;
+        };
         self.sessions[target] = UdpSession {
             occupied: true,
             client_ep,
@@ -318,7 +404,9 @@ impl UdpWorker {
     fn run(&mut self, stop: Arc<AtomicBool>) {
         let mut events = Vec::with_capacity(512);
         let busy_poll_ns = self.cfg.busy_poll_us.saturating_mul(1_000);
+        let session_timeout_ns = self.cfg.session_timeout_secs.saturating_mul(1_000_000_000);
         let mut last_work_ns = sys::fast_now_ns();
+        let mut last_reap_ns = last_work_ns;
         let mut spin_backoff_ns = 2_000u64;
         let mut iters: u64 = 0;
 
@@ -373,6 +461,13 @@ impl UdpWorker {
 
             if (iters & 0x3f) == 0 {
                 self.flush_stats();
+                if session_timeout_ns > 0 {
+                    let t = sys::fast_now_ns();
+                    if t.wrapping_sub(last_reap_ns) >= 2_000_000_000 {
+                        last_reap_ns = t;
+                        self.reap_idle_sessions(t, session_timeout_ns);
+                    }
+                }
             }
         }
 
@@ -386,7 +481,6 @@ impl UdpWorker {
         self.flush_stats();
     }
 
-    /// Unbatched baseline: 1 `recvfrom` + 1 `sendto`/`write` per datagram.
     fn drain_frontend_single(&mut self, now_ns: u64) {
         let mut tmp = [0u8; PKT_STRIDE];
         for _ in 0..self.batch_size {
@@ -443,8 +537,6 @@ impl UdpWorker {
         }
     }
 
-    /// Batched datapath: up to 64 UDP datagrams received in ONE `recvmsg_x` syscall and
-    /// forwarded in coalesced `sendmsg_x` batches!
     #[cfg(target_os = "macos")]
     fn drain_frontend_batched(&mut self, now_ns: u64) {
         let bsz = self.batch_size;
@@ -478,7 +570,6 @@ impl UdpWorker {
             _ => return,
         };
 
-        // Resolve target backend_fd for every packet in batch
         let mut target_fds = [-1 as Fd; MAX_BATCH];
         let mut pkt_lens = [0usize; MAX_BATCH];
         for i in 0..recvd {
@@ -494,7 +585,6 @@ impl UdpWorker {
             }
         }
 
-        // Group packets destined for the same connected backend_fd into single `sendmsg_x` calls!
         let mut sent_mask = [false; MAX_BATCH];
         let mut send_iovs = [IoVec {
             iov_base: ptr::null_mut(),
@@ -614,13 +704,146 @@ impl UdpWorker {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// Linux native `recvmmsg` / `sendmmsg` 64-packet batched UDP forwarding.
+    #[cfg(target_os = "linux")]
     fn drain_frontend_batched(&mut self, now_ns: u64) {
-        self.drain_frontend_single(now_ns);
+        let bsz = self.batch_size;
+        let mut addrs = [SockAddrIn::default(); MAX_BATCH];
+        let mut iovs = [IoVec {
+            iov_base: ptr::null_mut(),
+            iov_len: 0,
+        }; MAX_BATCH];
+        let mut msgs: [MsgHdrX; MAX_BATCH] = unsafe { std::mem::zeroed() };
+
+        for i in 0..bsz {
+            iovs[i] = IoVec {
+                iov_base: unsafe { self.pkt_arena.as_mut_ptr().add(i * PKT_STRIDE) as *mut c_void },
+                iov_len: PKT_STRIDE,
+            };
+            msgs[i].msg_hdr.msg_name = &mut addrs[i] as *mut SockAddrIn as *mut c_void;
+            msgs[i].msg_hdr.msg_namelen = size_of::<SockAddrIn>() as u32;
+            msgs[i].msg_hdr.msg_iov = &mut iovs[i] as *mut IoVec;
+            msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+
+        self.recv_sc += 1;
+        let recvd = match sys::recv_udp_batch(self.front_fd, &mut msgs[..bsz]) {
+            Ok(n) if n > 0 => n,
+            _ => return,
+        };
+
+        let mut target_fds = [-1 as Fd; MAX_BATCH];
+        let mut pkt_lens = [0usize; MAX_BATCH];
+        for i in 0..recvd {
+            let len = msgs[i].msg_len as usize;
+            pkt_lens[i] = len;
+            self.rx_pkts += 1;
+            self.rx_bytes += len as u64;
+            let client_ep = addrs[i].to_endpoint();
+            if let Some(slot) = self.get_or_create_session(client_ep, now_ns) {
+                target_fds[i] = self.sessions[slot].backend_fd;
+            } else {
+                self.drops += 1;
+            }
+        }
+
+        let mut sent_mask = [false; MAX_BATCH];
+        let mut send_iovs = [IoVec {
+            iov_base: ptr::null_mut(),
+            iov_len: 0,
+        }; MAX_BATCH];
+        let mut send_msgs: [MsgHdrX; MAX_BATCH] = unsafe { std::mem::zeroed() };
+
+        for i in 0..recvd {
+            if sent_mask[i] || target_fds[i] < 0 {
+                continue;
+            }
+            let fd = target_fds[i];
+            let mut cnt = 0usize;
+            let mut group_bytes = 0u64;
+            for j in i..recvd {
+                if !sent_mask[j] && target_fds[j] == fd {
+                    sent_mask[j] = true;
+                    let len = pkt_lens[j];
+                    send_iovs[cnt] = IoVec {
+                        iov_base: unsafe {
+                            self.pkt_arena.as_mut_ptr().add(j * PKT_STRIDE) as *mut c_void
+                        },
+                        iov_len: len,
+                    };
+                    send_msgs[cnt].msg_hdr.msg_name = ptr::null_mut();
+                    send_msgs[cnt].msg_hdr.msg_namelen = 0;
+                    send_msgs[cnt].msg_hdr.msg_iov = &mut send_iovs[cnt] as *mut IoVec;
+                    send_msgs[cnt].msg_hdr.msg_iovlen = 1;
+                    send_msgs[cnt].msg_len = 0;
+                    group_bytes += len as u64;
+                    cnt += 1;
+                }
+            }
+            self.send_sc += 1;
+            match sys::send_udp_batch(fd, &mut send_msgs[..cnt]) {
+                Ok(n) => {
+                    self.tx_pkts += n as u64;
+                    self.tx_bytes += group_bytes;
+                    if n < cnt {
+                        self.drops += (cnt - n) as u64;
+                    }
+                }
+                Err(_) => self.drops += cnt as u64,
+            }
+        }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn drain_backend_batched(&mut self, slot: usize, now_ns: u64) {
-        self.drain_backend_single(slot, now_ns);
+        let (bfd, client_ep) = match self.sessions.get_mut(slot) {
+            Some(s) if s.occupied => {
+                s.last_seen_ns = now_ns;
+                (s.backend_fd, s.client_ep)
+            }
+            _ => return,
+        };
+        let bsz = self.batch_size;
+        let mut iovs = [IoVec {
+            iov_base: ptr::null_mut(),
+            iov_len: 0,
+        }; MAX_BATCH];
+        let mut msgs: [MsgHdrX; MAX_BATCH] = unsafe { std::mem::zeroed() };
+        for i in 0..bsz {
+            iovs[i] = IoVec {
+                iov_base: unsafe { self.pkt_arena.as_mut_ptr().add(i * PKT_STRIDE) as *mut c_void },
+                iov_len: PKT_STRIDE,
+            };
+            msgs[i].msg_hdr.msg_iov = &mut iovs[i] as *mut IoVec;
+            msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        self.recv_sc += 1;
+        let recvd = match sys::recv_udp_batch(bfd, &mut msgs[..bsz]) {
+            Ok(n) if n > 0 => n,
+            _ => return,
+        };
+        let mut dst_addr = SockAddrIn::from_endpoint(client_ep);
+        let mut total_bytes = 0u64;
+        for i in 0..recvd {
+            let len = msgs[i].msg_len as usize;
+            self.rx_pkts += 1;
+            self.rx_bytes += len as u64;
+            total_bytes += len as u64;
+            iovs[i].iov_len = len;
+            msgs[i].msg_hdr.msg_name = &mut dst_addr as *mut SockAddrIn as *mut c_void;
+            msgs[i].msg_hdr.msg_namelen = size_of::<SockAddrIn>() as u32;
+            msgs[i].msg_len = 0;
+        }
+        self.send_sc += 1;
+        match sys::send_udp_batch(self.front_fd, &mut msgs[..recvd]) {
+            Ok(n) => {
+                self.tx_pkts += n as u64;
+                self.tx_bytes += total_bytes;
+                if n < recvd {
+                    self.drops += (recvd - n) as u64;
+                }
+            }
+            Err(_) => self.drops += recvd as u64,
+        }
     }
 }

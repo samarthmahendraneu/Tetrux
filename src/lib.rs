@@ -8,3 +8,4 @@ pub mod mem;
 pub mod metrics;
 pub mod proto;
 pub mod sys;
+pub mod vip;

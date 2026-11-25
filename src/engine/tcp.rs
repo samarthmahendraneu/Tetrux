@@ -13,15 +13,17 @@
 
 use crate::lb::balancer::{BackendPool, WorkerSelector};
 use crate::lb::hash::hash_endpoint;
+use crate::lb::ratelimit::{PerIpLimiter, RateLimitConfig};
 use crate::mem::cache::CachePadded;
 use crate::mem::slab::{BufferPool, PooledRing, Slab};
 use crate::mem::spsc::{spsc_channel, SpscConsumer, SpscProducer};
+use crate::proto::proxy_v2;
 use crate::sys::{self, EndpointV4, Fd, IoStatus, PollEvent, Poller, WakeHandle};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LISTEN_TOKEN: u64 = u64::MAX;
 const SCRATCH_SIZE: usize = 65536;
@@ -67,6 +69,12 @@ pub struct TcpEngineConfig {
     pub work_budget_bytes: usize,
     /// Prioritize short mouse RPC connections ahead of bulk elephant flows in each poll batch.
     pub mouse_first_scheduling: bool,
+    /// Prepend HAProxy PROXY Protocol v2 binary header to backend sockets to preserve client IP.
+    pub proxy_protocol_v2: bool,
+    /// Enable OS TCP keepalive idle time in seconds to detect dead half-open peers (0 = off).
+    pub tcp_keepalive_secs: i32,
+    /// Per-source-IP token-bucket & concurrent connection flood limiter.
+    pub rate_limit: RateLimitConfig,
     /// Idle connection timeout in seconds (0 = disabled).
     pub idle_timeout_secs: u64,
     /// Optional active TCP health check interval (None = disabled).
@@ -90,6 +98,9 @@ impl Default for TcpEngineConfig {
             busy_poll_us: 150,
             work_budget_bytes: 131_072,
             mouse_first_scheduling: true,
+            proxy_protocol_v2: false,
+            tcp_keepalive_secs: 30,
+            rate_limit: RateLimitConfig::default(),
             idle_timeout_secs: 60,
             health_check_interval: None,
         }
@@ -100,6 +111,7 @@ impl Default for TcpEngineConfig {
 pub struct WorkerCounters {
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
+    pub rate_limited: AtomicU64,
     pub active: AtomicU64,
     pub peak_active: AtomicU64,
     pub bytes_c2b: AtomicU64,
@@ -121,6 +133,7 @@ impl Default for WorkerCounters {
         Self {
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
             active: AtomicU64::new(0),
             peak_active: AtomicU64::new(0),
             bytes_c2b: AtomicU64::new(0),
@@ -143,6 +156,7 @@ impl Default for WorkerCounters {
 pub struct TcpStatsSnapshot {
     pub accepted: u64,
     pub rejected: u64,
+    pub rate_limited: u64,
     pub active: u64,
     pub peak_active: u64,
     pub bytes_c2b: u64,
@@ -175,6 +189,7 @@ enum ConnState {
 struct TcpConn {
     client_fd: Fd,
     backend_fd: Fd,
+    client_peer: EndpointV4,
     generation: u32,
     backend_idx: u16,
     state: ConnState,
@@ -202,6 +217,7 @@ fn decode_token(token: u64) -> (u32, bool, u32) {
 
 pub struct TcpNlbHandle {
     bound_addr: EndpointV4,
+    accept_stop: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     counters: Arc<Vec<CachePadded<WorkerCounters>>>,
     wakers: Vec<WakeHandle>,
@@ -218,6 +234,7 @@ impl TcpNlbHandle {
         for c in self.counters.iter() {
             s.accepted += c.accepted.load(Ordering::Relaxed);
             s.rejected += c.rejected.load(Ordering::Relaxed);
+            s.rate_limited += c.rate_limited.load(Ordering::Relaxed);
             s.active += c.active.load(Ordering::Relaxed);
             s.peak_active += c.peak_active.load(Ordering::Relaxed);
             s.bytes_c2b += c.bytes_c2b.load(Ordering::Relaxed);
@@ -236,7 +253,30 @@ impl TcpNlbHandle {
         s
     }
 
-    pub fn stop(mut self) {
+    /// Graceful Tier-0 drain: immediately stops accepting new connections while allowing
+    /// existing in-flight TCP streams to complete up to `drain_timeout`, then shuts down workers.
+    pub fn drain_and_stop(mut self, drain_timeout: Duration) {
+        self.begin_drain(drain_timeout);
+        self.stop_inner();
+    }
+
+    /// Stop accepting new connections and wait up to `drain_timeout` for active conns to reach 0.
+    pub fn begin_drain(&self, drain_timeout: Duration) {
+        self.accept_stop.store(true, Ordering::Release);
+        for w in &self.wakers {
+            w.wake();
+        }
+        let deadline = Instant::now() + drain_timeout;
+        while Instant::now() < deadline {
+            if self.stats().active == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn stop_inner(&mut self) {
+        self.accept_stop.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
         for w in &self.wakers {
             w.wake();
@@ -245,17 +285,15 @@ impl TcpNlbHandle {
             let _ = t.join();
         }
     }
+
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
 }
 
 impl Drop for TcpNlbHandle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        for w in &self.wakers {
-            w.wake();
-        }
-        for t in self.threads.drain(..) {
-            let _ = t.join();
-        }
+        self.stop_inner();
     }
 }
 
@@ -265,6 +303,7 @@ pub fn start_tcp_nlb(
     pool: Arc<BackendPool>,
 ) -> io::Result<TcpNlbHandle> {
     let num_workers = config.workers.max(1);
+    let accept_stop = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let counters: Arc<Vec<CachePadded<WorkerCounters>>> = Arc::new(
         (0..num_workers)
@@ -287,6 +326,7 @@ pub fn start_tcp_nlb(
                 false,
                 config.sock_buf_bytes,
             )?;
+            sys::enable_tcp_keepalive(listen_fd, config.tcp_keepalive_secs, 10, 3);
 
             let mut producers = Vec::with_capacity(num_workers);
             let mut sleeping_flags = Vec::with_capacity(num_workers);
@@ -305,6 +345,7 @@ pub fn start_tcp_nlb(
 
                 let cfg = config.clone();
                 let pool_c = Arc::clone(&pool);
+                let acc_stop_c = Arc::clone(&accept_stop);
                 let stop_c = Arc::clone(&stop);
                 let cnt_c = Arc::clone(&counters);
 
@@ -315,6 +356,7 @@ pub fn start_tcp_nlb(
                             sys::pin_thread_performance(wid);
                             let mut worker = TcpWorker::new(
                                 wid,
+                                bound,
                                 cfg,
                                 poller,
                                 None,
@@ -323,7 +365,7 @@ pub fn start_tcp_nlb(
                                 pool_c,
                                 cnt_c,
                             );
-                            worker.run(stop_c);
+                            worker.run(acc_stop_c, stop_c);
                         })?,
                 );
             }
@@ -331,7 +373,7 @@ pub fn start_tcp_nlb(
             let acc_poller = Poller::new(64)?;
             let acc_wake = acc_poller.wake_handle();
             wakers.push(acc_wake);
-            let stop_acc = Arc::clone(&stop);
+            let stop_acc = Arc::clone(&accept_stop);
             let cnt_acc = Arc::clone(&counters);
 
             threads.push(
@@ -360,11 +402,13 @@ pub fn start_tcp_nlb(
                 true,
                 config.sock_buf_bytes,
             )?;
+            sys::enable_tcp_keepalive(first_fd, config.tcp_keepalive_secs, 10, 3);
             let mut listen_fds = Vec::with_capacity(num_workers);
             listen_fds.push(first_fd);
             for _ in 1..num_workers {
                 let (fd, _) =
                     sys::create_tcp_listener(bound, config.backlog, true, config.sock_buf_bytes)?;
+                sys::enable_tcp_keepalive(fd, config.tcp_keepalive_secs, 10, 3);
                 listen_fds.push(fd);
             }
 
@@ -374,6 +418,7 @@ pub fn start_tcp_nlb(
                 let sleeping = Arc::new(CachePadded::new(AtomicBool::new(false)));
                 let cfg = config.clone();
                 let pool_c = Arc::clone(&pool);
+                let acc_stop_c = Arc::clone(&accept_stop);
                 let stop_c = Arc::clone(&stop);
                 let cnt_c = Arc::clone(&counters);
 
@@ -384,6 +429,7 @@ pub fn start_tcp_nlb(
                             sys::pin_thread_performance(wid);
                             let mut worker = TcpWorker::new(
                                 wid,
+                                bound,
                                 cfg,
                                 poller,
                                 Some(lfd),
@@ -392,7 +438,7 @@ pub fn start_tcp_nlb(
                                 pool_c,
                                 cnt_c,
                             );
-                            worker.run(stop_c);
+                            worker.run(acc_stop_c, stop_c);
                         })?,
                 );
             }
@@ -402,6 +448,7 @@ pub fn start_tcp_nlb(
 
     Ok(TcpNlbHandle {
         bound_addr,
+        accept_stop,
         stop,
         counters,
         wakers,
@@ -493,12 +540,14 @@ fn run_sharded_acceptor(
 
 struct TcpWorker {
     wid: usize,
+    bound_vip: EndpointV4,
     cfg: TcpEngineConfig,
     poller: Poller,
     listen_fd: Option<Fd>,
     accept_rx: Option<SpscConsumer<AcceptedFd>>,
     sleeping: Arc<CachePadded<AtomicBool>>,
     selector: WorkerSelector,
+    limiter: PerIpLimiter,
     slab: Slab<TcpConn>,
     buf_pool: BufferPool,
     /// L1/L2-hot aligned scratch buffer for bufferless fast-path forwarding.
@@ -508,6 +557,7 @@ struct TcpWorker {
     // Worker-local hot stats flushed periodically to avoid atomic write contention
     local_accepted: u64,
     local_rejected: u64,
+    local_rate_limited: u64,
     local_bytes_c2b: u64,
     local_bytes_b2c: u64,
     local_poll_calls: u64,
@@ -524,6 +574,7 @@ impl TcpWorker {
     #[allow(clippy::too_many_arguments)]
     fn new(
         wid: usize,
+        bound_vip: EndpointV4,
         cfg: TcpEngineConfig,
         mut poller: Poller,
         listen_fd: Option<Fd>,
@@ -538,14 +589,17 @@ impl TcpWorker {
         let buf_pool = BufferPool::new(cfg.pool_chunks_per_worker, cfg.pool_chunk_bytes)
             .expect("failed to allocate page-aligned BufferPool");
         let slab = Slab::with_capacity(cfg.max_conns_per_worker);
+        let limiter = PerIpLimiter::new(cfg.rate_limit);
         Self {
             wid,
+            bound_vip,
             cfg,
             poller,
             listen_fd,
             accept_rx,
             sleeping,
             selector: WorkerSelector::new(pool, wid),
+            limiter,
             slab,
             buf_pool,
             scratch: vec![0u8; SCRATCH_SIZE].into_boxed_slice(),
@@ -553,6 +607,7 @@ impl TcpWorker {
             counters,
             local_accepted: 0,
             local_rejected: 0,
+            local_rate_limited: 0,
             local_bytes_c2b: 0,
             local_bytes_b2c: 0,
             local_poll_calls: 0,
@@ -575,6 +630,11 @@ impl TcpWorker {
         if self.local_rejected > 0 {
             c.rejected.fetch_add(self.local_rejected, Ordering::Relaxed);
             self.local_rejected = 0;
+        }
+        if self.local_rate_limited > 0 {
+            c.rate_limited
+                .fetch_add(self.local_rate_limited, Ordering::Relaxed);
+            self.local_rate_limited = 0;
         }
         c.active.store(self.slab.len() as u64, Ordering::Relaxed);
         c.peak_active
@@ -625,7 +685,7 @@ impl TcpWorker {
             .store(sys::thread_cpu_time_ns(), Ordering::Relaxed);
     }
 
-    fn run(&mut self, stop: Arc<AtomicBool>) {
+    fn run(&mut self, accept_stop: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
         let mut events = Vec::with_capacity(512);
         let mut deferred_elephants = Vec::with_capacity(64);
         let mut accept_buf = [AcceptedFd {
@@ -641,6 +701,13 @@ impl TcpWorker {
 
         while !stop.load(Ordering::Relaxed) {
             loop_iters = loop_iters.wrapping_add(1);
+            // In ReusePort mode, close listener immediately on graceful drain start!
+            if accept_stop.load(Ordering::Acquire) {
+                if let Some(lfd) = self.listen_fd.take() {
+                    self.poller.del_read(lfd);
+                    sys::close_fd(lfd);
+                }
+            }
             let mut accepted_now = false;
 
             // 1. Drain lock-free SPSC accept ring in userspace first (0 syscalls!)
@@ -803,8 +870,14 @@ impl TcpWorker {
             self.local_rejected += 1;
             return;
         }
+        if !self.limiter.admit(peer.ip, now_ns) {
+            sys::close_fd(client_fd);
+            self.local_rate_limited += 1;
+            return;
+        }
         let flow_hash = hash_endpoint(peer);
         let Some((backend_idx, backend_ep)) = self.selector.select(flow_hash) else {
+            self.limiter.release_conn(peer.ip);
             sys::close_fd(client_fd);
             self.local_rejected += 1;
             return;
@@ -814,12 +887,16 @@ impl TcpWorker {
         {
             Ok(v) => v,
             Err(_) => {
+                self.limiter.release_conn(peer.ip);
                 self.selector.pool().record_failure(backend_idx as usize);
                 sys::close_fd(client_fd);
                 self.local_rejected += 1;
                 return;
             }
         };
+        if self.cfg.tcp_keepalive_secs > 0 {
+            sys::enable_tcp_keepalive(backend_fd, self.cfg.tcp_keepalive_secs, 10, 3);
+        }
 
         self.next_gen = self.next_gen.wrapping_add(1) & 0x7fff_ffff;
         if self.next_gen == 0 {
@@ -836,6 +913,7 @@ impl TcpWorker {
         let conn = TcpConn {
             client_fd,
             backend_fd,
+            client_peer: peer,
             generation: gen,
             backend_idx,
             state,
@@ -848,6 +926,7 @@ impl TcpWorker {
         };
 
         let Some(slot) = self.slab.insert(conn) else {
+            self.limiter.release_conn(peer.ip);
             sys::close_fd(client_fd);
             sys::close_fd(backend_fd);
             self.local_rejected += 1;
@@ -868,6 +947,11 @@ impl TcpWorker {
             self.selector
                 .pool()
                 .record_connect_latency(backend_idx as usize, 1000);
+            if self.cfg.proxy_protocol_v2 && !self.send_proxy_v2_header(slot, peer, backend_fd, gen)
+            {
+                self.close_conn(slot);
+                return;
+            }
             // Both sockets ready immediately -> register reads in batched changelist (0 syscalls now!)
             self.poller.add_read(client_fd, c_tok, false);
             self.poller.add_read(backend_fd, b_tok, false);
@@ -875,6 +959,46 @@ impl TcpWorker {
             // Wait for async backend connect completion; also register client read only once connected
             // (keeps early client bytes safely buffered in kernel recvbuf without leasing userspace RAM!)
             self.poller.add_connect_write(backend_fd, b_tok);
+        }
+    }
+
+    /// Write 28-byte binary HAProxy PROXY Protocol v2 header (0 heap allocations!) to backend.
+    fn send_proxy_v2_header(&mut self, slot: u32, peer: EndpointV4, backend_fd: Fd, gen: u32) -> bool {
+        let hdr = proxy_v2::encode_tcp_v4(peer, self.bound_vip);
+        self.local_write_calls += 1;
+        match sys::write_nb(backend_fd, &hdr) {
+            IoStatus::Ok(w) if w == hdr.len() => {
+                self.local_bytes_c2b += w as u64;
+                true
+            }
+            IoStatus::Ok(w) => {
+                self.local_bytes_c2b += w as u64;
+                self.scratch[..hdr.len() - w].copy_from_slice(&hdr[w..]);
+                let client_fd = self.slab.get(slot).map(|c| c.client_fd).unwrap_or(-1);
+                self.enqueue_backpressure_from_scratch(
+                    slot,
+                    true,
+                    0,
+                    hdr.len() - w,
+                    client_fd,
+                    backend_fd,
+                    gen,
+                )
+            }
+            IoStatus::WouldBlock => {
+                self.scratch[..hdr.len()].copy_from_slice(&hdr);
+                let client_fd = self.slab.get(slot).map(|c| c.client_fd).unwrap_or(-1);
+                self.enqueue_backpressure_from_scratch(
+                    slot,
+                    true,
+                    0,
+                    hdr.len(),
+                    client_fd,
+                    backend_fd,
+                    gen,
+                )
+            }
+            IoStatus::Eof | IoStatus::Error(_) => false,
         }
     }
 
@@ -916,9 +1040,19 @@ impl TcpWorker {
                     self.selector
                         .pool()
                         .record_connect_latency(backend_idx as usize, lat);
-                    if let Some(c) = self.slab.get_mut(slot) {
-                        c.state = ConnState::Established;
-                        c.flags &= !F_BACKEND_WR_ARMED;
+                    let peer = match self.slab.get_mut(slot) {
+                        Some(c) => {
+                            c.state = ConnState::Established;
+                            c.flags &= !F_BACKEND_WR_ARMED;
+                            c.client_peer
+                        }
+                        None => return,
+                    };
+                    if self.cfg.proxy_protocol_v2
+                        && !self.send_proxy_v2_header(slot, peer, backend_fd, conn_gen)
+                    {
+                        self.close_conn(slot);
+                        return;
                     }
                     let c_tok = encode_token(slot, false, conn_gen);
                     let b_tok = encode_token(slot, true, conn_gen);
@@ -1296,6 +1430,7 @@ impl TcpWorker {
 
     fn close_conn(&mut self, slot: u32) {
         if let Some(mut c) = self.slab.remove(slot) {
+            self.limiter.release_conn(c.client_peer.ip);
             c.c2b.release_if_held(&mut self.buf_pool);
             c.b2c.release_if_held(&mut self.buf_pool);
             sys::close_fd(c.client_fd);

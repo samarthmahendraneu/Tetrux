@@ -14,13 +14,16 @@ use std::mem::{size_of, zeroed};
 use std::ptr;
 
 pub const AF_INET: i32 = 2;
+pub const AF_INET6: i32 = 30;
 pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_DGRAM: i32 = 2;
 pub const IPPROTO_TCP: i32 = 6;
 pub const IPPROTO_UDP: i32 = 17;
+pub const IPPROTO_IPV6: i32 = 41;
 
 pub const SOL_SOCKET: i32 = 0xffff;
 pub const SO_REUSEADDR: i32 = 0x0004;
+pub const SO_KEEPALIVE: i32 = 0x0008;
 pub const SO_REUSEPORT: i32 = 0x0200;
 pub const SO_SNDBUF: i32 = 0x1001;
 pub const SO_RCVBUF: i32 = 0x1002;
@@ -29,7 +32,11 @@ pub const SO_NOSIGPIPE: i32 = 0x1022;
 
 pub const TCP_NODELAY: i32 = 0x01;
 pub const TCP_NOPUSH: i32 = 0x04;
+pub const TCP_KEEPALIVE: i32 = 0x10;
+pub const TCP_KEEPINTVL: i32 = 0x101;
+pub const TCP_KEEPCNT: i32 = 0x102;
 pub const TCP_FASTOPEN: i32 = 0x105;
+pub const IPV6_V6ONLY: i32 = 27;
 
 pub const F_GETFL: i32 = 3;
 pub const F_SETFL: i32 = 4;
@@ -491,6 +498,85 @@ pub fn close_fd(fd: Fd) {
 pub fn shutdown_write(fd: Fd) {
     unsafe {
         shutdown(fd, SHUT_WR);
+    }
+}
+
+/// Enable OS TCP keepalive to automatically detect & reap dead half-open zombie peers.
+#[inline]
+pub fn enable_tcp_keepalive(fd: Fd, idle_secs: i32, intvl_secs: i32, count: i32) {
+    if idle_secs <= 0 {
+        return;
+    }
+    let _ = set_sockopt_i32(fd, SOL_SOCKET, SO_KEEPALIVE, 1);
+    let _ = set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPALIVE, idle_secs);
+    let _ = set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPINTVL, intvl_secs.max(1));
+    let _ = set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPCNT, count.max(1));
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockAddrIn6 {
+    pub sin6_len: u8,
+    pub sin6_family: u8,
+    pub sin6_port: u16,
+    pub sin6_flowinfo: u32,
+    pub sin6_addr: [u8; 16],
+    pub sin6_scope_id: u32,
+}
+
+/// Create a non-blocking IPv6 / dual-stack (`dual_stack = true` clears `IPV6_V6ONLY`) TCP listener.
+pub fn create_tcp_listener_v6(
+    addr: std::net::Ipv6Addr,
+    port: u16,
+    backlog: i32,
+    dual_stack: bool,
+    reuse_port: bool,
+    buf_bytes: i32,
+) -> io::Result<(Fd, u16)> {
+    let fd = unsafe { socket(AF_INET6, SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let res = (|| -> io::Result<u16> {
+        set_nonblocking(fd)?;
+        set_sockopt_i32(fd, SOL_SOCKET, SO_REUSEADDR, 1)?;
+        let _ = set_sockopt_i32(fd, IPPROTO_IPV6, IPV6_V6ONLY, if dual_stack { 0 } else { 1 });
+        if reuse_port {
+            let _ = set_sockopt_i32(fd, SOL_SOCKET, SO_REUSEPORT, 1);
+        }
+        let _ = set_sockopt_i32(fd, SOL_SOCKET, SO_NOSIGPIPE, 1);
+        let _ = set_sockopt_i32(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+        if buf_bytes > 0 {
+            let _ = set_sockopt_i32(fd, SOL_SOCKET, SO_RCVBUF, buf_bytes);
+            let _ = set_sockopt_i32(fd, SOL_SOCKET, SO_SNDBUF, buf_bytes);
+        }
+        let sa = SockAddrIn6 {
+            sin6_len: size_of::<SockAddrIn6>() as u8,
+            sin6_family: AF_INET6 as u8,
+            sin6_port: port.to_be(),
+            sin6_flowinfo: 0,
+            sin6_addr: addr.octets(),
+            sin6_scope_id: 0,
+        };
+        if unsafe { bind(fd, &sa as *const _ as *const SockAddrIn, size_of::<SockAddrIn6>() as u32) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { listen(fd, backlog) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut bound = sa;
+        let mut len = size_of::<SockAddrIn6>() as u32;
+        if unsafe { getsockname(fd, &mut bound as *mut _ as *mut SockAddrIn, &mut len) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u16::from_be(bound.sin6_port))
+    })();
+    match res {
+        Ok(p) => Ok((fd, p)),
+        Err(e) => {
+            close_fd(fd);
+            Err(e)
+        }
     }
 }
 

@@ -21,16 +21,23 @@ pub const SOCK_NONBLOCK: i32 = 0o4000;
 pub const SOCK_CLOEXEC: i32 = 0o2000000;
 
 pub const IPPROTO_TCP: i32 = 6;
+pub const IPPROTO_IPV6: i32 = 41;
 pub const SOL_SOCKET: i32 = 1;
 pub const SOL_XDP: i32 = 283;
 pub const SO_REUSEADDR: i32 = 2;
+pub const SO_KEEPALIVE: i32 = 9;
 pub const SO_REUSEPORT: i32 = 15;
 pub const SO_SNDBUF: i32 = 7;
 pub const SO_RCVBUF: i32 = 8;
 pub const SO_ERROR: i32 = 4;
 
 pub const TCP_NODELAY: i32 = 1;
+pub const TCP_KEEPIDLE: i32 = 4;
+pub const TCP_KEEPINTVL: i32 = 5;
+pub const TCP_KEEPCNT: i32 = 6;
+pub const TCP_USER_TIMEOUT: i32 = 18;
 pub const TCP_FASTOPEN: i32 = 23;
+pub const IPV6_V6ONLY: i32 = 26;
 pub const MSG_DONTWAIT: i32 = 0x40;
 pub const MSG_NOSIGNAL: i32 = 0x4000;
 
@@ -383,6 +390,20 @@ pub fn shutdown_write(fd: Fd) {
     unsafe {
         shutdown(fd, SHUT_WR);
     }
+}
+
+/// Enable Linux TCP keepalive + `TCP_USER_TIMEOUT` for dead half-open peer reaping.
+#[inline]
+pub fn enable_tcp_keepalive(fd: Fd, idle_secs: i32, intvl_secs: i32, count: i32) {
+    if idle_secs <= 0 {
+        return;
+    }
+    let _ = set_sockopt_i32(fd, SOL_SOCKET, SO_KEEPALIVE, 1);
+    let _ = set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPIDLE, idle_secs);
+    let _ = set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPINTVL, intvl_secs.max(1));
+    let _ = set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPCNT, count.max(1));
+    let user_timeout_ms = (idle_secs + intvl_secs.max(1) * count.max(1)) * 1000;
+    let _ = set_sockopt_i32(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, user_timeout_ms);
 }
 
 pub fn create_tcp_listener(
