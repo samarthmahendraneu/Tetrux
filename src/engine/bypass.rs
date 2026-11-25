@@ -367,6 +367,12 @@ pub struct BypassWorker {
     /// Reverse NAT table (used only in `FullBidirectionalNat` mode).
     rev_conntrack: ConntrackTable,
     arp: Arc<ArpTable>,
+    /// Worker-local lock-free ARP cache synchronized via 1 relaxed generation check!
+    arp_gen: u64,
+    local_arp: Vec<(u32, [u8; 6])>,
+    cached_gw_mac: [u8; 6],
+    /// Precomputed 1's-complement base sum for outer IPIP IPv4 header (3-cycle checksum!).
+    ipip_base_sum: u32,
     next_nat_port: u16,
     counters: Arc<CachePadded<BypassCounters>>,
     rx_pkts: u64,
@@ -395,11 +401,20 @@ impl BypassWorker {
         } else {
             64
         };
+        let cached_gw_mac = cfg.gateway_mac;
+        // Precompute constant words of outer IPIP IPv4 header:
+        // ver_ihl_tos=0x4500, flags_frag=0x4000, ttl_proto=0x4004, src_ip=cfg.lb_ip
+        let ipip_base_sum =
+            0x4500u32 + 0x4000u32 + 0x4004u32 + (cfg.lb_ip >> 16) + (cfg.lb_ip & 0xffff);
         Self {
             wid,
             conntrack: ConntrackTable::with_capacity(cfg.conntrack_capacity),
             rev_conntrack: ConntrackTable::with_capacity(rev_cap),
             arp: Arc::new(ArpTable::new(300)),
+            arp_gen: 0,
+            local_arp: Vec::new(),
+            cached_gw_mac,
+            ipip_base_sum,
             next_nat_port: 20_000u16.wrapping_add((wid as u16) * 4096),
             cfg,
             umem,
@@ -421,6 +436,31 @@ impl BypassWorker {
 
     pub fn arp_table(&self) -> Arc<ArpTable> {
         Arc::clone(&self.arp)
+    }
+
+    /// Lock-free worker-local ARP lookup (0 locks on steady state!).
+    #[inline(always)]
+    fn resolve_mac_fast(&mut self, ip: u32, fallback: [u8; 6], now_ns: u64) -> [u8; 6] {
+        let g = self.arp.generation();
+        if g == 0 {
+            return fallback;
+        }
+        if g != self.arp_gen {
+            self.local_arp = self.arp.snapshot_entries(now_ns);
+            self.cached_gw_mac = self
+                .local_arp
+                .iter()
+                .find(|&&(k, _)| k == self.cfg.gateway_ip)
+                .map(|&(_, m)| m)
+                .unwrap_or(self.cfg.gateway_mac);
+            self.arp_gen = g;
+        }
+        for &(k, mac) in &self.local_arp {
+            if k == ip {
+                return mac;
+            }
+        }
+        fallback
     }
 
     #[inline(always)]
@@ -577,26 +617,34 @@ impl BypassWorker {
             std::slice::from_raw_parts_mut(base.add(new_addr as usize), ETH_HDR_LEN + IPIP_HDR_LEN)
         };
 
-        // Resolve next-hop MAC: dynamic ARP for gateway or backend MAC fallback
-        let dst_mac = self
-            .arp
-            .lookup(self.cfg.gateway_ip, now_ns)
-            .unwrap_or_else(|| self.selector.mac_of(backend_idx));
+        // Resolve next-hop MAC lock-free (0 RwLock on hot path!)
+        let gw_fallback = self.selector.mac_of(backend_idx);
+        let dst_mac = self.resolve_mac_fast(self.cfg.gateway_ip, gw_fallback, now_ns);
         out[0..6].copy_from_slice(&dst_mac);
         out[6..12].copy_from_slice(&self.cfg.lb_mac);
         out[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
 
-        // Write 20-byte outer IPv4 header (proto = 4 IPIP, total_len = 20 + inner_ip_len)
+        // Write 20-byte outer IPv4 header with O(1) 3-cycle precomputed checksum!
+        let outer_total_len = (inner_ip_len + IPIP_HDR_LEN) as u16;
         let outer = &mut out[ETH_HDR_LEN..ETH_HDR_LEN + IPIP_HDR_LEN];
-        outer.fill(0);
-        outer[0] = 0x45; // IPv4, IHL=5
-        outer[2..4].copy_from_slice(&((inner_ip_len + IPIP_HDR_LEN) as u16).to_be_bytes());
-        outer[6] = 0x40; // DF (Don't Fragment)
+        outer[0] = 0x45;
+        outer[1] = 0;
+        outer[2..4].copy_from_slice(&outer_total_len.to_be_bytes());
+        outer[4] = 0;
+        outer[5] = 0;
+        outer[6] = 0x40; // DF
+        outer[7] = 0;
         outer[8] = 64; // TTL
         outer[9] = IPPROTO_IPIP;
         outer[12..16].copy_from_slice(&self.cfg.lb_ip.to_be_bytes());
         outer[16..20].copy_from_slice(&backend_ip.to_be_bytes());
-        let outer_csum = rfc1071_checksum(outer);
+        let mut s = self.ipip_base_sum
+            + (outer_total_len as u32)
+            + (backend_ip >> 16)
+            + (backend_ip & 0xffff);
+        s = (s & 0xffff) + (s >> 16);
+        s = (s & 0xffff) + (s >> 16);
+        let outer_csum = !(s as u16);
         outer[10..12].copy_from_slice(&outer_csum.to_be_bytes());
 
         desc.addr = new_addr;
@@ -705,10 +753,7 @@ impl BypassWorker {
                 self.rev_nat_pkts += 1;
 
                 // Rewrite L2 + IPv4 src=VIP, dst=orig_client + L4 sport=vip_port, dport=orig_client_port
-                let gw_mac = self
-                    .arp
-                    .lookup(orig_client_ip, now_ns)
-                    .unwrap_or(self.cfg.gateway_mac);
+                let gw_mac = self.resolve_mac_fast(orig_client_ip, self.cfg.gateway_mac, now_ns);
                 pkt[0..6].copy_from_slice(&gw_mac);
                 pkt[6..12].copy_from_slice(&self.cfg.lb_mac);
 
@@ -808,10 +853,8 @@ impl BypassWorker {
             (bidx, ep.ip, ep.port, nat_p)
         };
 
-        let dst_mac = self
-            .arp
-            .lookup(backend_ip, now_ns)
-            .unwrap_or_else(|| self.selector.mac_of(backend_idx));
+        let fallback_mac = self.selector.mac_of(backend_idx);
+        let dst_mac = self.resolve_mac_fast(backend_ip, fallback_mac, now_ns);
         pkt[0..6].copy_from_slice(&dst_mac);
         pkt[6..12].copy_from_slice(&self.cfg.lb_mac);
 
