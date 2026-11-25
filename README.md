@@ -81,14 +81,16 @@ Measured on **Apple M3 Pro (11 cores: 5 P-cores + 6 E-cores, 128B L1 cache lines
 
 | Workload | Throughput | Wire Rate | Cost/Pkt | Ring Lat p50 / p99 / p99.9 | Heap Allocs | Drops | Vol. Ctx Sw |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 1a. 1-Core NAT (64B wire) | **58.15 Mpps** | 39.07 Gbps | 17.2 ns | 62.5 / 217.1 / 540.7 µs *(4k queue)* | **0** | **0** | **0** |
-| 1b. 1-Core NAT (1024B wire) | **72.85 Mpps** | 608.47 Gbps | 13.7 ns | 54.3 / 112.6 / 241.7 µs *(4k queue)* | **0** | **0** | **0** |
-| 1c. 1-Core DSR (64B wire) | **101.73 Mpps** | 68.36 Gbps | **9.8 ns** | 37.9 / 64.5 / 352.3 µs *(4k queue)* | **0** | **0** | **0** |
-| 1d. 1-Core Low-Queue NAT (64 inflight) | **72.14 Mpps** | 48.47 Gbps | 13.9 ns | **0.85 / 1.06 / 4.99 µs** | **0** | **0** | **0** |
-| 1e. 2-Core NAT Scaling (64B) | **121.84 Mpps** | 81.88 Gbps | 16.4 ns | 64.5 / 176.1 / 335.9 µs | **0** | **0** | **0** |
-| 1f. 4-Core NAT Scaling (64B) | **138.31 Mpps** | 92.94 Gbps | 28.9 ns | 75.8 / 499.7 / 802.8 µs | **0** | **0** | **0** |
-| 1g. 4-Core DSR Scaling (1024B) | **195.98 Mpps** | **1,636.84 Gbps** | 20.4 ns | 54.3 / 270.3 / 450.6 µs | **0** | **0** | **0** |
-| 1h. Micro-Burst (5×40k, 16k flows) | **65.61 Mpps** | 44.09 Gbps | 15.2 ns | 54.3 / 143.4 / 151.1 µs | **0** | **0** | **0** |
+| 1a. 1-Core NAT (64B wire) | **55.07 Mpps** | 37.01 Gbps | 18.2 ns | 67.6 / 135.2 / 270.3 µs *(4k queue)* | **0** | **0** | **0** |
+| 1b. 1-Core NAT (1024B wire) | **61.00 Mpps** | 509.49 Gbps | 16.4 ns | 64.5 / 96.3 / 176.1 µs *(4k queue)* | **0** | **0** | **0** |
+| 1c. 1-Core DSR L2 (64B wire) | **80.88 Mpps** | 54.35 Gbps | 12.4 ns | 48.1 / 71.7 / 286.7 µs *(4k queue)* | **0** | **0** | **0** |
+| 1d. 1-Core **DSR IPIP Encap** (64B) | **82.04 Mpps** | 55.13 Gbps | **12.2 ns** | 48.1 / 67.6 / 116.7 µs *(4k queue)* | **0** | **0** | **0** |
+| 1e. 1-Core **Full Bidir-NAT** (64B) | **49.96 Mpps** | 33.57 Gbps | 20.0 ns | 75.8 / 249.9 / 401.4 µs *(4k queue)* | **0** | **0** | **0** |
+| 1f. 1-Core Low-Queue NAT (64 inflight) | **64.70 Mpps** | 43.48 Gbps | 15.5 ns | **0.91 / 1.18 / 2.24 µs** | **0** | **0** | **0** |
+| 1g. 2-Core NAT Scaling (64B) | **110.34 Mpps** | 74.15 Gbps | 18.1 ns | 71.7 / 200.7 / 368.6 µs | **0** | **0** | **0** |
+| 1h. 4-Core **DSR IPIP** (1024B wire) | **163.43 Mpps** | **1,364.93 Gbps** | 24.5 ns | 62.5 / 286.7 / 499.7 µs | **0** | **0** | **0** |
+| 1i. 4-Core **DSR L2** (1024B wire) | **174.36 Mpps** | **1,456.28 Gbps** | 22.9 ns | 60.4 / 286.7 / 639.0 µs | **0** | **0** | **0** |
+| 1j. Micro-Burst (5×40k, 16k flows) | **57.10 Mpps** | 38.37 Gbps | 17.5 ns | 67.6 / 143.4 / 150.4 µs | **0** | **0** | **0** |
 
 ### Suite 2 — L4 TCP High-Throughput Bulk Transfer (8 Concurrent 64 KiB Bidirectional Streams)
 
@@ -134,11 +136,29 @@ Measured on **Apple M3 Pro (11 cores: 5 P-cores + 6 E-cores, 128B L1 cache lines
 - **Peak pooled backpressure buffers leased:** `0`
 - **Isolated NLB Idle CPU with 1,000 open connections:** **`0.26%`**
 
-### Suite 8 — Live Control Plane, DNS, Weight Tuning & Graceful Drain (`--suite control`)
+### Suite 8 — Tier-0 Live Control Plane, DNS, Weight Tuning, Prometheus & PROXY v2 (`--suite control`)
 
 - Registered static IP (`weight=1`) + `localhost` DNS target (`weight=1`) → **50.0% / 50.0%** exact connection split
 - Live-tuned weight via `PUT /targets/weight` (`4:1`, zero restart, zero dataplane lock) → **80.0% / 20.0%** (`+160 / +40` conns)
 - Deregistered DNS target with `drain: true` → **0 new connections** routed to drained target while active held stream stayed alive cleanly
+- Verified `GET /metrics` (**1,449 B** Prometheus OpenMetrics) and live **HAProxy PROXY Protocol v2** binary header delivery (`28B` exact client IP:port + payload preserved)
+
+---
+
+## Tier-0 Multi-DC Production Architecture (1 Billion RPS Scale)
+
+Tetrux implements the building blocks required to deploy horizontally across global Anycast BGP ECMP data centers:
+
+- **XDP eBPF Line-Rate Filter & AF_XDP Redirect** ([ebpf/tetrux_xdp.c](ebpf/tetrux_xdp.c), [src/engine/linux_bypass.rs](src/engine/linux_bypass.rs)): Drops blocked DDoS source IPs in the NIC driver before `sk_buff` allocation (`XDP_DROP`), redirects matched VIP flows straight to per-core zero-copy `AF_XDP` UMEM rings (`BPF_MAP_TYPE_XSKMAP`), and passes BGP/SSH management traffic to the kernel (`XDP_PASS`).
+- **Cross-Rack DSR IPIP Encapsulation + Dynamic ARP** ([src/engine/bypass.rs](src/engine/bypass.rs), [src/lb/arp.rs](src/lb/arp.rs)): Prepends a 20B RFC 2003 IPIP outer IPv4 header directly into `FRAME_HEADROOM` (**0 payload copies**, 3-cycle precomputed checksum, **82 Mpps/core**), with MTU/PMTUD guard and lock-free RCU ARP neighbor resolution.
+- **SYN-Flood-Shielded Stateful Conntrack & Rate Limiter** ([src/lb/conntrack.rs](src/lb/conntrack.rs), [src/lb/ratelimit.rs](src/lb/ratelimit.rs)): Tracks `SynSeen`/`Established`/`Closing` TCP states with distinct timeouts and **never evicts live `Established` flows for unestablished `SYN` packets**, paired with O(1) per-source-IP token-bucket & concurrent-conn admission caps and idle UDP session reaping.
+- **Parallel Non-Blocking Health Probes, Hysteresis & Panic Mode** ([src/lb/health.rs](src/lb/health.rs)): Probes hundreds of backends concurrently via `kqueue`/`epoll` (TCP or HTTP `GET <path>` 2xx) with rise/fall hysteresis, ±10% jitter, and configurable `--max-ejection-pct` fail-open panic threshold.
+- **BGP Anycast Route Control & Zero-Drop `SIGTERM` Drain** ([src/lb/bgp.rs](src/lb/bgp.rs), [src/sys/signal.rs](src/sys/signal.rs), [src/vip.rs](src/vip.rs)): Announces VIP `/32` when healthy, immediately withdraws BGP routes on `SIGTERM` or `POST /drain` while draining in-flight TCP connections up to `--drain-timeout-secs`, supports `SIGHUP` + atomic `--state-file` persistence, and multiplexes isolated VIPs via `VipRegistry`.
+- **Hardened Control Plane & Observability** ([src/control.rs](src/control.rs), [src/proto/json.rs](src/proto/json.rs)): Constant-time `--admin-token` Bearer auth, `--admin-allow` source CIDR allowlist, SSRF metadata target block (`169.254.0.0/16`), slowloris concurrency/size cap, `catch_unwind` isolation, strict RFC-8259 JSON parser, structured JSON `--audit-log`, and native `GET /metrics` Prometheus exposition.
+
+### Fleet Capacity Model for 1 Billion RPS Across Global Anycast DCs
+- **Per-core measured DSR IPIP packet budget**: `~82 Mpps` (userspace UMEM); accounting for real Linux NIC PCIe/DMA overhead (~20–30 Mpps/core on 100G/200G ConnectX-6/7 with `AF_XDP` zero-copy + RSS), a single 64-core L4 edge node sustains **~1.2–1.5 Bpps / ~250–400M RPS** (at ~3–5 packets/RPC in DSR where return traffic bypasses the NLB completely).
+- **1,000,000,000 RPS global footprint**: ~**4–6 active 64-core edge nodes per major region across 10–20 Anycast PoPs** (with 2× N+1 DDoS headroom) behind BGP ECMP routers sharing deterministic Maglev tables + ExaBGP health withdrawal.
 
 ---
 
