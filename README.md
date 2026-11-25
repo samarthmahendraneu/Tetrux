@@ -1,4 +1,4 @@
-# Tetrux — Ultra-Low-Level Rust L4 Network Load Balancer
+# Tetrux : Ultra-Low-Level Rust L4 Network Load Balancer
 
 **Tetrux** is a zero-dependency, thread-per-core Layer-4 (TCP/UDP & raw L2/L3/L4 packet) Network Load Balancer written in Rust, engineered from scratch for:
 
