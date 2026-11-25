@@ -773,6 +773,17 @@ impl Poller {
         }
     }
 
+    pub fn disable_read(&mut self, fd: Fd) {
+        let mut ev = EpollEvent { events: 0, data: 0 };
+        unsafe {
+            epoll_ctl(self.epfd, EPOLL_CTL_MOD, fd, &mut ev);
+        }
+    }
+
+    pub fn enable_read(&mut self, fd: Fd, token: u64) {
+        self.add_read(fd, token, false);
+    }
+
     pub fn poll(&mut self, out: &mut Vec<PollEvent>, timeout_ns: Option<u64>) -> io::Result<usize> {
         out.clear();
         let timeout_ms = match timeout_ns {

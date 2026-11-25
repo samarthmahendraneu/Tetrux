@@ -817,6 +817,10 @@ pub struct Poller {
     raw_events: Vec<Kevent>,
 }
 
+// SAFETY: `Kevent::udata` only stores integer tokens (never dereferenced pointers),
+// and `kq` is an OS file descriptor safe to transfer across threads.
+unsafe impl Send for Poller {}
+
 /// Thread-safe handle to trigger a coalesced `EVFILT_USER` wakeup on a sleeping `Poller`.
 #[derive(Clone, Copy)]
 pub struct WakeHandle {
@@ -936,6 +940,32 @@ impl Poller {
             fflags: 0,
             data: 0,
             udata: ptr::null_mut(),
+        });
+    }
+
+    /// Temporarily pause read notifications during backpressure (batched in changelist, 0 syscalls!).
+    #[inline(always)]
+    pub fn disable_read(&mut self, fd: Fd) {
+        self.push_change(Kevent {
+            ident: fd as usize,
+            filter: EVFILT_READ,
+            flags: EV_DISABLE,
+            fflags: 0,
+            data: 0,
+            udata: ptr::null_mut(),
+        });
+    }
+
+    /// Re-enable read notifications once backpressure clears (batched in changelist, 0 syscalls!).
+    #[inline(always)]
+    pub fn enable_read(&mut self, fd: Fd, token: u64) {
+        self.push_change(Kevent {
+            ident: fd as usize,
+            filter: EVFILT_READ,
+            flags: EV_ENABLE,
+            fflags: 0,
+            data: 0,
+            udata: token as usize as *mut c_void,
         });
     }
 
