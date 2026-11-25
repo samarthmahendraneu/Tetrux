@@ -65,6 +65,8 @@ pub struct TcpEngineConfig {
     pub busy_poll_us: u64,
     /// Fair per-connection byte budget per poll turn to protect mouse RPC tail latency.
     pub work_budget_bytes: usize,
+    /// Prioritize short mouse RPC connections ahead of bulk elephant flows in each poll batch.
+    pub mouse_first_scheduling: bool,
     /// Idle connection timeout in seconds (0 = disabled).
     pub idle_timeout_secs: u64,
     /// Optional active TCP health check interval (None = disabled).
@@ -87,6 +89,7 @@ impl Default for TcpEngineConfig {
             pool_chunk_bytes: 65_536,
             busy_poll_us: 150,
             work_budget_bytes: 131_072,
+            mouse_first_scheduling: true,
             idle_timeout_secs: 60,
             health_check_interval: None,
         }
@@ -110,6 +113,7 @@ pub struct WorkerCounters {
     pub wakeups_sent: AtomicU64,
     pub wakeups_suppressed: AtomicU64,
     pub peak_buffers_used: AtomicU64,
+    pub worker_cpu_ns: AtomicU64,
 }
 
 impl Default for WorkerCounters {
@@ -130,6 +134,7 @@ impl Default for WorkerCounters {
             wakeups_sent: AtomicU64::new(0),
             wakeups_suppressed: AtomicU64::new(0),
             peak_buffers_used: AtomicU64::new(0),
+            worker_cpu_ns: AtomicU64::new(0),
         }
     }
 }
@@ -151,6 +156,7 @@ pub struct TcpStatsSnapshot {
     pub wakeups_sent: u64,
     pub wakeups_suppressed: u64,
     pub peak_buffers_used: u64,
+    pub worker_cpu_ns: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -173,6 +179,8 @@ struct TcpConn {
     backend_idx: u16,
     state: ConnState,
     flags: u8,
+    /// EWMA bytes moved per turn (used by Mouse-First tail-latency scheduler).
+    ewma_turn_bytes: u32,
     connect_start_ns: u64,
     last_active_ns: u64,
     c2b: PooledRing,
@@ -223,6 +231,7 @@ impl TcpNlbHandle {
             s.wakeups_sent += c.wakeups_sent.load(Ordering::Relaxed);
             s.wakeups_suppressed += c.wakeups_suppressed.load(Ordering::Relaxed);
             s.peak_buffers_used += c.peak_buffers_used.load(Ordering::Relaxed);
+            s.worker_cpu_ns += c.worker_cpu_ns.load(Ordering::Relaxed);
         }
         s
     }
@@ -612,10 +621,13 @@ impl TcpWorker {
                 .fetch_add(self.local_buf_writes, Ordering::Relaxed);
             self.local_buf_writes = 0;
         }
+        c.worker_cpu_ns
+            .store(sys::thread_cpu_time_ns(), Ordering::Relaxed);
     }
 
     fn run(&mut self, stop: Arc<AtomicBool>) {
         let mut events = Vec::with_capacity(512);
+        let mut deferred_elephants = Vec::with_capacity(64);
         let mut accept_buf = [AcceptedFd {
             fd: -1,
             peer: EndpointV4::default(),
@@ -624,17 +636,18 @@ impl TcpWorker {
         let idle_timeout_ns = self.cfg.idle_timeout_secs.saturating_mul(1_000_000_000);
         let mut last_work_ns = sys::fast_now_ns();
         let mut last_reap_ns = last_work_ns;
+        let mut spin_backoff_ns: u64 = 2_000;
         let mut loop_iters: u64 = 0;
 
         while !stop.load(Ordering::Relaxed) {
             loop_iters = loop_iters.wrapping_add(1);
-            let mut did_work = false;
+            let mut accepted_now = false;
 
             // 1. Drain lock-free SPSC accept ring in userspace first (0 syscalls!)
             if let Some(ref mut rx) = self.accept_rx {
                 let n = rx.pop_batch(&mut accept_buf);
                 if n > 0 {
-                    did_work = true;
+                    accepted_now = true;
                     let now = sys::fast_now_ns();
                     for item in &accept_buf[..n] {
                         self.admit_connection(item.fd, item.peer, now);
@@ -647,7 +660,7 @@ impl TcpWorker {
             let in_busy_window =
                 busy_poll_ns > 0 && now.wrapping_sub(last_work_ns) < busy_poll_ns;
 
-            let timeout_ns = if did_work || in_busy_window {
+            let timeout_ns = if accepted_now || in_busy_window {
                 Some(0)
             } else {
                 // Classic store-load barrier before blocking to guarantee zero lost wakeups
@@ -675,29 +688,63 @@ impl TcpWorker {
                 self.sleeping.store(false, Ordering::Release);
             }
 
+            let mut did_work = accepted_now;
             if n > 0 {
                 did_work = true;
                 self.local_poll_events += n as u64;
                 let ev_now = sys::fast_now_ns();
-                for i in 0..events.len() {
-                    let ev = events[i];
-                    if ev.is_user {
-                        continue;
+                if self.cfg.mouse_first_scheduling && events.len() > 1 {
+                    // Two-Tier Tail-Latency Scheduler:
+                    // Pass 1: Dispatch Mouse RPC / control / accept events immediately!
+                    // Pass 2: Dispatch Elephant bulk streams afterward with bounded turn budget!
+                    deferred_elephants.clear();
+                    for i in 0..events.len() {
+                        let ev = events[i];
+                        if ev.is_user {
+                            continue;
+                        }
+                        if ev.token == LISTEN_TOKEN {
+                            self.accept_from_listener(ev_now);
+                            continue;
+                        }
+                        let (slot, _, gen) = decode_token(ev.token);
+                        let is_elephant = self
+                            .slab
+                            .get(slot)
+                            .map(|c| c.generation == gen && c.ewma_turn_bytes >= 8192)
+                            .unwrap_or(false);
+                        if is_elephant {
+                            deferred_elephants.push(ev);
+                        } else {
+                            self.handle_conn_event(ev, ev_now);
+                        }
                     }
-                    if ev.token == LISTEN_TOKEN {
-                        self.accept_from_listener(ev_now);
-                        continue;
+                    for i in 0..deferred_elephants.len() {
+                        self.handle_conn_event(deferred_elephants[i], ev_now);
                     }
-                    self.handle_conn_event(ev, ev_now);
+                } else {
+                    for i in 0..events.len() {
+                        let ev = events[i];
+                        if ev.is_user {
+                            continue;
+                        }
+                        if ev.token == LISTEN_TOKEN {
+                            self.accept_from_listener(ev_now);
+                            continue;
+                        }
+                        self.handle_conn_event(ev, ev_now);
+                    }
                 }
             }
 
             if did_work {
                 last_work_ns = sys::fast_now_ns();
+                spin_backoff_ns = 2_000;
             } else if in_busy_window {
-                // Pace non-blocking kevent probes (~1.5us userspace spin checking SPSC accept ring)
-                // to keep sub-5us tail latency while cutting idle busy-poll syscalls by ~15x!
-                let spin_until = sys::fast_now_ns() + 1_500;
+                // Exponential userspace spin backoff (2us -> 4us -> 8us -> 16us) checking the
+                // lock-free SPSC ring directly: keeps sub-ms tail latency while minimizing
+                // empty kevent(timeout=0) kernel mode switches!
+                let spin_until = sys::fast_now_ns() + spin_backoff_ns;
                 while sys::fast_now_ns() < spin_until {
                     if let Some(ref mut rx) = self.accept_rx {
                         if !rx.is_empty() {
@@ -706,6 +753,7 @@ impl TcpWorker {
                     }
                     sys::cpu_relax();
                 }
+                spin_backoff_ns = (spin_backoff_ns << 1).min(16_000);
             }
 
             if (loop_iters & 0x3f) == 0 {
@@ -792,6 +840,7 @@ impl TcpWorker {
             backend_idx,
             state,
             flags: if immediate { 0 } else { F_BACKEND_WR_ARMED },
+            ewma_turn_bytes: 0,
             connect_start_ns: now_ns,
             last_active_ns: now_ns,
             c2b: PooledRing::empty(),
@@ -1159,6 +1208,13 @@ impl TcpWorker {
                     }
                     IoStatus::Error(_) => return false,
                 }
+            }
+        }
+        // Update EWMA bytes moved per turn (alpha = 1/4) for Mouse vs Elephant classification
+        if moved > 0 {
+            if let Some(c) = self.slab.get_mut(slot) {
+                let prev = c.ewma_turn_bytes as u64;
+                c.ewma_turn_bytes = (((prev * 3) + moved as u64) >> 2).min(u32::MAX as u64) as u32;
             }
         }
         true

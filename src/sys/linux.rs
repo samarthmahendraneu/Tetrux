@@ -257,6 +257,15 @@ pub fn monotonic_clock_ns() -> u64 {
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
 
+#[inline]
+pub fn thread_cpu_time_ns() -> u64 {
+    let mut ts = TimeSpec::default();
+    unsafe {
+        clock_gettime(3, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
 pub fn raise_nofile_limit(target: u64) -> u64 {
     #[repr(C)]
     struct RLimit {

@@ -61,6 +61,7 @@ pub struct UdpCounters {
     pub poll_calls: AtomicU64,
     pub sessions_created: AtomicU64,
     pub drops: AtomicU64,
+    pub worker_cpu_ns: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -74,6 +75,7 @@ pub struct UdpStatsSnapshot {
     pub poll_calls: u64,
     pub sessions_created: u64,
     pub drops: u64,
+    pub worker_cpu_ns: u64,
 }
 
 impl UdpStatsSnapshot {
@@ -133,6 +135,7 @@ impl UdpNlbHandle {
             poll_calls: c.poll_calls.load(Ordering::Relaxed),
             sessions_created: c.sessions_created.load(Ordering::Relaxed),
             drops: c.drops.load(Ordering::Relaxed),
+            worker_cpu_ns: c.worker_cpu_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -254,6 +257,8 @@ impl UdpWorker {
         c.sessions_created
             .fetch_add(self.sessions_created, Ordering::Relaxed);
         c.drops.fetch_add(self.drops, Ordering::Relaxed);
+        c.worker_cpu_ns
+            .store(sys::thread_cpu_time_ns(), Ordering::Relaxed);
         self.rx_pkts = 0;
         self.tx_pkts = 0;
         self.rx_bytes = 0;
@@ -314,6 +319,7 @@ impl UdpWorker {
         let mut events = Vec::with_capacity(512);
         let busy_poll_ns = self.cfg.busy_poll_us.saturating_mul(1_000);
         let mut last_work_ns = sys::fast_now_ns();
+        let mut spin_backoff_ns = 2_000u64;
         let mut iters: u64 = 0;
 
         while !stop.load(Ordering::Relaxed) {
@@ -356,11 +362,13 @@ impl UdpWorker {
                     }
                 }
                 last_work_ns = sys::fast_now_ns();
+                spin_backoff_ns = 2_000;
             } else if in_busy {
-                let spin_until = sys::fast_now_ns() + 1_500;
+                let spin_until = sys::fast_now_ns() + spin_backoff_ns;
                 while sys::fast_now_ns() < spin_until {
                     sys::cpu_relax();
                 }
+                spin_backoff_ns = (spin_backoff_ns << 1).min(16_000);
             }
 
             if (iters & 0x3f) == 0 {

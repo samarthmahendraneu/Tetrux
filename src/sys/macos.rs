@@ -69,6 +69,7 @@ const RLIMIT_NOFILE: i32 = 8;
 const MACH_TASK_BASIC_INFO: u32 = 20;
 const MACH_TASK_BASIC_INFO_COUNT: u32 = 12;
 const CLOCK_UPTIME_RAW: i32 = 8;
+const CLOCK_THREAD_CPUTIME_ID: i32 = 16;
 
 const USER_WAKE_IDENT: usize = 0x5445_5452_5558_0001; // "TETRUX\0\1"
 
@@ -334,6 +335,18 @@ pub fn monotonic_clock_ns() -> u64 {
     let mut ts = TimeSpec::default();
     unsafe {
         clock_gettime(CLOCK_UPTIME_RAW, &mut ts);
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+/// Exact CPU time consumed by the calling thread (user + kernel), in nanoseconds.
+#[inline]
+pub fn thread_cpu_time_ns() -> u64 {
+    let mut ts = TimeSpec::default();
+    unsafe {
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts);
     }
     (ts.tv_sec as u64)
         .saturating_mul(1_000_000_000)

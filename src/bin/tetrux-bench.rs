@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -127,45 +127,32 @@ impl FastTcpBackend {
                                     continue;
                                 }
                                 let mut close = false;
-                                for _ in 0..4 {
-                                    match sys::read_nb(fd, &mut scratch) {
-                                        IoStatus::Ok(r) => match sys::write_nb(fd, &scratch[..r]) {
-                                            IoStatus::Ok(w) if w == r => {
-                                                if r < scratch.len() {
-                                                    break;
-                                                }
+                                // Fair 1-read turn in backend so backend itself doesn't HoL-block mice!
+                                match sys::read_nb(fd, &mut scratch) {
+                                    IoStatus::Ok(r) => match sys::write_nb(fd, &scratch[..r]) {
+                                        IoStatus::Ok(w) if w == r => {}
+                                        IoStatus::Ok(w) => {
+                                            if let Some((off, buf)) = pending.get_mut(&fd) {
+                                                *off = 0;
+                                                buf.clear();
+                                                buf.extend_from_slice(&scratch[w..r]);
+                                                poller.arm_write_oneshot(fd, fd as u64);
+                                                poller.disable_read(fd);
                                             }
-                                            IoStatus::Ok(w) => {
-                                                if let Some((off, buf)) = pending.get_mut(&fd) {
-                                                    *off = 0;
-                                                    buf.clear();
-                                                    buf.extend_from_slice(&scratch[w..r]);
-                                                    poller.arm_write_oneshot(fd, fd as u64);
-                                                    poller.disable_read(fd);
-                                                }
-                                                break;
-                                            }
-                                            IoStatus::WouldBlock => {
-                                                if let Some((off, buf)) = pending.get_mut(&fd) {
-                                                    *off = 0;
-                                                    buf.clear();
-                                                    buf.extend_from_slice(&scratch[..r]);
-                                                    poller.arm_write_oneshot(fd, fd as u64);
-                                                    poller.disable_read(fd);
-                                                }
-                                                break;
-                                            }
-                                            _ => {
-                                                close = true;
-                                                break;
-                                            }
-                                        },
-                                        IoStatus::WouldBlock => break,
-                                        IoStatus::Eof | IoStatus::Error(_) => {
-                                            close = true;
-                                            break;
                                         }
-                                    }
+                                        IoStatus::WouldBlock => {
+                                            if let Some((off, buf)) = pending.get_mut(&fd) {
+                                                *off = 0;
+                                                buf.clear();
+                                                buf.extend_from_slice(&scratch[..r]);
+                                                poller.arm_write_oneshot(fd, fd as u64);
+                                                poller.disable_read(fd);
+                                            }
+                                        }
+                                        _ => close = true,
+                                    },
+                                    IoStatus::WouldBlock => {}
+                                    IoStatus::Eof | IoStatus::Error(_) => close = true,
                                 }
                                 if close {
                                     pending.remove(&fd);
@@ -217,21 +204,72 @@ impl FastUdpBackend {
         let thread = std::thread::Builder::new()
             .name(format!("bench-udp-be-{id}"))
             .spawn(move || {
+                sys::pin_thread_performance(id + 6);
                 let mut poller = Poller::new(16).unwrap();
                 poller.add_read(fd, 1, false);
                 let mut events = Vec::with_capacity(16);
-                let mut buf = [0u8; 2048];
-                while !stop_c.load(Ordering::Relaxed) {
-                    let n = poller.poll(&mut events, Some(5_000_000)).unwrap_or(0);
-                    if n == 0 {
-                        continue;
-                    }
-                    for _ in 0..128 {
-                        match sys::recvfrom_nb(fd, &mut buf) {
-                            Ok(Some((len, peer))) => {
-                                let _ = sys::sendto_nb(fd, &buf[..len], peer);
+                #[cfg(target_os = "macos")]
+                {
+                    let mut arena = vec![0u8; 64 * 2048];
+                    let mut addrs = [sys::SockAddrIn::default(); 64];
+                    let mut iovs = [sys::IoVec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    }; 64];
+                    let mut msgs = [sys::MsgHdrX::default(); 64];
+                    while !stop_c.load(Ordering::Relaxed) {
+                        let n = poller.poll(&mut events, Some(5_000_000)).unwrap_or(0);
+                        if n == 0 {
+                            continue;
+                        }
+                        loop {
+                            for i in 0..64 {
+                                iovs[i] = sys::IoVec {
+                                    iov_base: unsafe { arena.as_mut_ptr().add(i * 2048) as *mut std::ffi::c_void },
+                                    iov_len: 2048,
+                                };
+                                msgs[i] = sys::MsgHdrX {
+                                    msg_name: &mut addrs[i] as *mut sys::SockAddrIn as *mut std::ffi::c_void,
+                                    msg_namelen: std::mem::size_of::<sys::SockAddrIn>() as u32,
+                                    msg_iov: &mut iovs[i] as *mut sys::IoVec,
+                                    msg_iovlen: 1,
+                                    msg_control: std::ptr::null_mut(),
+                                    msg_controllen: 0,
+                                    msg_flags: 0,
+                                    msg_datalen: 0,
+                                };
                             }
-                            _ => break,
+                            let got = sys::recv_udp_batch(fd, &mut msgs).unwrap_or(0);
+                            if got == 0 {
+                                break;
+                            }
+                            for i in 0..got {
+                                iovs[i].iov_len = msgs[i].msg_datalen;
+                                msgs[i].msg_flags = 0;
+                                msgs[i].msg_datalen = 0;
+                            }
+                            let _ = sys::send_udp_batch(fd, &msgs[..got]);
+                            if got < 64 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let mut buf = [0u8; 2048];
+                    while !stop_c.load(Ordering::Relaxed) {
+                        let n = poller.poll(&mut events, Some(5_000_000)).unwrap_or(0);
+                        if n == 0 {
+                            continue;
+                        }
+                        for _ in 0..128 {
+                            match sys::recvfrom_nb(fd, &mut buf) {
+                                Ok(Some((len, peer))) => {
+                                    let _ = sys::sendto_nb(fd, &buf[..len], peer);
+                                }
+                                _ => break,
+                            }
                         }
                     }
                 }
@@ -380,13 +418,11 @@ fn run_bypass_single(
     cfg.mode = mode;
     cfg.conntrack_capacity = 65_536;
 
-    // Two-barrier handshake:
-    // - `setup_barrier`: every thread has completed 100% of startup allocations
-    // - `go_barrier`: main snapshots AllocSnapshot::now() = 0 hot-path allocs proof!
+    // Lock-free atomic spin-gate handshake (zero std::sync::Barrier heap allocations!)
     let stop = Arc::new(AtomicBool::new(false));
-    let setup_barrier = Arc::new(Barrier::new(workers * 2 + 1));
-    let go_barrier = Arc::new(Barrier::new(workers * 2 + 1));
-    let done_barrier = Arc::new(Barrier::new(workers + 1));
+    let ready_cnt = Arc::new(AtomicUsize::new(0));
+    let go_flag = Arc::new(AtomicBool::new(false));
+    let done_cnt = Arc::new(AtomicUsize::new(0));
     let mut lb_threads = Vec::with_capacity(workers);
     let mut nic_threads = Vec::with_capacity(workers);
     let mut all_counters = Vec::with_capacity(workers);
@@ -429,23 +465,25 @@ fn run_bypass_single(
             Arc::clone(&counters),
         );
         let stop_lb = Arc::clone(&stop);
-        let sbar_lb = Arc::clone(&setup_barrier);
-        let gbar_lb = Arc::clone(&go_barrier);
+        let rc_lb = Arc::clone(&ready_cnt);
+        let gf_lb = Arc::clone(&go_flag);
         lb_threads.push(
             std::thread::Builder::new()
                 .name(format!("bypass-lb-{w}"))
                 .spawn(move || {
-                    sbar_lb.wait();
-                    gbar_lb.wait();
+                    rc_lb.fetch_add(1, Ordering::Release);
+                    while !gf_lb.load(Ordering::Acquire) {
+                        sys::cpu_relax();
+                    }
                     worker.run_pmd_loop(lb, stop_lb);
                 })
                 .unwrap(),
         );
 
         let umem_nic = Arc::clone(&umem);
-        let sbar_nic = Arc::clone(&setup_barrier);
-        let gbar_nic = Arc::clone(&go_barrier);
-        let dbar_nic = Arc::clone(&done_barrier);
+        let rc_nic = Arc::clone(&ready_cnt);
+        let gf_nic = Arc::clone(&go_flag);
+        let dc_nic = Arc::clone(&done_cnt);
         nic_threads.push(
             std::thread::Builder::new()
                 .name(format!("bypass-nic-{w}"))
@@ -457,8 +495,10 @@ fn run_bypass_single(
                         .collect();
                     let mut rx_batch = [PacketDesc::default(); BURST_SIZE];
                     let mut tx_batch = [PacketDesc::default(); BURST_SIZE];
-                    sbar_nic.wait();
-                    gbar_nic.wait();
+                    rc_nic.fetch_add(1, Ordering::Release);
+                    while !gf_nic.load(Ordering::Acquire) {
+                        sys::cpu_relax();
+                    }
 
                     if let Some((waves, pkts_per_wave)) = micro_burst_waves {
                         for _wave in 0..waves {
@@ -552,7 +592,7 @@ fn run_bypass_single(
                             }
                         }
                     }
-                    dbar_nic.wait();
+                    dc_nic.fetch_add(1, Ordering::Release);
                     hist
                 })
                 .unwrap(),
@@ -560,13 +600,17 @@ fn run_bypass_single(
     }
 
     // All threads finish pre-allocation BEFORE we snapshot AllocSnapshot & RUsage!
-    setup_barrier.wait();
+    while ready_cnt.load(Ordering::Acquire) < workers * 2 {
+        sys::cpu_relax();
+    }
     let alloc_start = AllocSnapshot::now();
     let ru_start = sys::sample_process_metrics();
     let t0 = Instant::now();
-    go_barrier.wait();
+    go_flag.store(true, Ordering::Release);
 
-    done_barrier.wait();
+    while done_cnt.load(Ordering::Acquire) < workers {
+        sys::cpu_relax();
+    }
     let elapsed = t0.elapsed();
     let alloc_end = AllocSnapshot::now();
     let ru_end = sys::sample_process_metrics();
@@ -736,12 +780,11 @@ fn suite_2_tcp_bulk(backends: &[EndpointV4]) {
         100.0
     };
     println!(
-        "  {:<34} | {:6.2} Gbps | {:7.1} MiB | usr={:5.1}ms sys={:5.1}ms | vcs={:<7} ivcs={:<6} | rss={:.1} MiB | fast_path={:.1}% ev/poll={:.1}",
+        "  {:<34} | {:6.2} Gbps | {:7.1} MiB | nlb_cpu={:6.1}ms | vcs={:<7} ivcs={:<6} | rss={:.1} MiB | fast_path={:.1}% ev/poll={:.1}",
         "Tetrux L4 TCP (4w, busy-poll)",
         t_gbps,
         t_bytes as f64 / (1024.0 * 1024.0),
-        t_ru.user_time_us as f64 / 1000.0,
-        t_ru.sys_time_us as f64 / 1000.0,
+        st.worker_cpu_ns as f64 / 1_000_000.0,
         t_ru.voluntary_ctx_switches,
         t_ru.involuntary_ctx_switches,
         t_ru.current_rss_bytes as f64 / (1024.0 * 1024.0),
@@ -867,10 +910,10 @@ fn suite_3_tcp_rpc(backends: &[EndpointV4]) {
         let l = hist.summary_us();
         let sc_per_req = (st.poll_calls + st.read_calls + st.write_calls) as f64 / hist.count().max(1) as f64;
         println!(
-            "    {:<32} | {:9.0} RPS | p50={:6.1}us p95={:6.1}us p99={:6.1}us p99.9={:7.1}us max={:7.1}us | vcs={:<7} sys={:5.1}ms | sc/req={:.2}",
+            "    {:<32} | {:9.0} RPS | p50={:6.1}us p95={:6.1}us p99={:6.1}us p99.9={:7.1}us max={:7.1}us | vcs={:<7} nlb_cpu={:6.1}ms | sc/req={:.2}",
             label,
             rps, l.p50_us, l.p95_us, l.p99_us, l.p999_us, l.max_us,
-            ru.voluntary_ctx_switches, ru.sys_time_us as f64 / 1000.0, sc_per_req
+            ru.voluntary_ctx_switches, st.worker_cpu_ns as f64 / 1_000_000.0, sc_per_req
         );
     }
 
@@ -905,15 +948,16 @@ fn suite_4_mixed_isolation(backends: &[EndpointV4]) {
     println!("==================================================================================================================================");
     let pool_specs: Vec<BackendSpec> = backends.iter().map(|&e| BackendSpec::new(e)).collect();
 
-    for (label, budget) in [
-        ("Unbounded Turn (work_budget=2MiB)", 2 * 1024 * 1024usize),
-        ("Tetrux Fair Budget (32 KiB/turn)", 32 * 1024usize),
+    for (label, budget, mouse_first) in [
+        ("FIFO Unbounded (budget=2MiB)", 2 * 1024 * 1024usize, false),
+        ("Tetrux Mouse-First + 16KiB Budget", 16 * 1024usize, true),
     ] {
         let pool = BackendPool::new(pool_specs.clone(), LbAlgorithm::P2cLeastConn);
         let mut cfg = TcpEngineConfig::default();
         cfg.workers = 2; // Deliberately share 2 workers across elephants + mice to stress scheduling fairness!
         cfg.busy_poll_us = 150;
         cfg.work_budget_bytes = budget;
+        cfg.mouse_first_scheduling = mouse_first;
         let nlb = start_tcp_nlb(cfg, pool).unwrap();
         let target = nlb.bound_addr();
 
@@ -1169,24 +1213,26 @@ fn run_udp_bench(batched: bool, udp_backends: &[EndpointV4], payload_bytes: usiz
     // Each client round-trip = 2 forwarded UDP packets through NLB (C->B + B->C)
     let forwarded_pps = st.tx_packets as f64 / elapsed;
     let total_io_sc = st.recv_syscalls + st.send_syscalls;
+    let nlb_cpu_ms = st.worker_cpu_ns as f64 / 1_000_000.0;
+    let cpu_ns_per_pkt = st.worker_cpu_ns as f64 / st.tx_packets.max(1) as f64;
     let label = if batched {
         "Tetrux UDP Batched (recvmsg_x)"
     } else {
         "Baseline UDP Single (recvfrom)"
     };
     println!(
-        "  {:<32} | {:9.0} PPS | pkts/syscall={:5.2} | io_syscalls={:<8} | sys={:5.1}ms vcs={:<7} | p50={:6.1}us p99={:6.1}us p99.9={:7.1}us",
+        "  {:<32} | {:9.0} PPS | pkts/sc={:5.2} | io_sc={:<7} | nlb_cpu={:5.1}ms ({:5.0} ns/pkt) | p50={:5.1}us p99={:6.1}us p99.9={:6.1}us",
         label,
         forwarded_pps,
         st.pkts_per_syscall(),
         total_io_sc,
-        ru_d.sys_time_us as f64 / 1000.0,
-        ru_d.voluntary_ctx_switches,
+        nlb_cpu_ms,
+        cpu_ns_per_pkt,
         l.p50_us,
         l.p99_us,
         l.p999_us,
     );
-    let _ = total_echoed;
+    let _ = (total_echoed, ru_d);
 }
 
 fn suite_6_udp_batching() {
@@ -1245,12 +1291,14 @@ fn suite_7_memory_footprint(backends: &[EndpointV4], nofile_limit: u64) {
     std::thread::sleep(Duration::from_millis(120));
 
     let rss_loaded = sys::sample_process_metrics().current_rss_bytes;
+    let st_idle_s = nlb.stats();
     let idle_s = sys::sample_process_metrics();
     std::thread::sleep(Duration::from_millis(400));
     let idle_e = sys::sample_process_metrics();
-    let idle_d = ProcessMetrics::delta(&idle_s, &idle_e);
-    let idle_cpu_pct = ((idle_d.user_time_us + idle_d.sys_time_us) as f64 / 400_000.0) * 100.0;
     let st = nlb.stats();
+    let idle_d = ProcessMetrics::delta(&idle_s, &idle_e);
+    let proc_idle_cpu_pct = ((idle_d.user_time_us + idle_d.sys_time_us) as f64 / 400_000.0) * 100.0;
+    let nlb_idle_cpu_pct = (st.worker_cpu_ns.saturating_sub(st_idle_s.worker_cpu_ns) as f64 / 400_000_000.0) * 100.0;
 
     let rss_delta = rss_loaded.saturating_sub(rss_base);
     let bytes_per_conn = if opened > 0 {
@@ -1270,8 +1318,8 @@ fn suite_7_memory_footprint(backends: &[EndpointV4], nofile_limit: u64) {
         bytes_per_conn,
     );
     println!(
-        "  Active Conns={} | Peak Pooled Backpressure Buffers Leased={} | Idle CPU with {} open conns={:.2}%",
-        st.active, st.peak_buffers_used, opened, idle_cpu_pct
+        "  Active Conns={} | Peak Pooled Backpressure Buffers Leased={} | NLB Idle CPU={:.2}% (Total Proc Idle={:.2}%)",
+        st.active, st.peak_buffers_used, nlb_idle_cpu_pct, proc_idle_cpu_pct
     );
 
     drop(conns);
